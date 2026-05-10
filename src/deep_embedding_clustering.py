@@ -1,111 +1,41 @@
-import os
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+import random
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-import tensorflow as tf
 
 from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
     silhouette_score,
     calinski_harabasz_score,
     davies_bouldin_score,
 )
 
-
-class ClusteringLayer(tf.keras.layers.Layer):
-    """
-    DEC clustering layer.
-    Возвращает soft assignment q_ij по распределению Student's t.
-    """
-
-    def __init__(self, n_clusters: int, alpha: float = 1.0, **kwargs):
-        super().__init__(**kwargs)
-        self.n_clusters = n_clusters
-        self.alpha = alpha
-        self.clusters = None
-
-    def build(self, input_shape):
-        latent_dim = int(input_shape[-1])
-        self.clusters = self.add_weight(
-            shape=(self.n_clusters, latent_dim),
-            initializer="glorot_uniform",
-            trainable=True,
-            name="clusters",
-        )
-        super().build(input_shape)
-
-    def call(self, inputs):
-        # Student t-distribution, как в DEC
-        expanded_inputs = tf.expand_dims(inputs, axis=1)              # (batch, 1, d)
-        expanded_centers = tf.expand_dims(self.clusters, axis=0)      # (1, k, d)
-
-        distances = tf.reduce_sum(tf.square(expanded_inputs - expanded_centers), axis=2)
-        q = 1.0 / (1.0 + distances / self.alpha)
-        q = q ** ((self.alpha + 1.0) / 2.0)
-        q = q / tf.reduce_sum(q, axis=1, keepdims=True)
-        return q
+from src.cluster_features import prepare_cluster_matrix
 
 
-def target_distribution(q: np.ndarray) -> np.ndarray:
-    """
-    Target distribution p из статьи DEC.
-    """
-    weight = (q ** 2) / np.sum(q, axis=0, keepdims=True)
-    return (weight.T / np.sum(weight, axis=1)).T
+@dataclass
+class DECTrainingHistory:
+    pretrain_losses: list
 
 
-def build_autoencoder(input_dim: int, latent_dim: int = 10):
-    """
-    Небольшой автоэнкодер для табличных признаков.
-    """
-    inputs = tf.keras.Input(shape=(input_dim,), name="input")
+def _set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
 
-    x = tf.keras.layers.Dense(128, activation="relu")(inputs)
-    x = tf.keras.layers.Dense(64, activation="relu")(x)
-    latent = tf.keras.layers.Dense(latent_dim, activation="linear", name="latent")(x)
+    try:
+        import torch
 
-    x = tf.keras.layers.Dense(64, activation="relu")(latent)
-    x = tf.keras.layers.Dense(128, activation="relu")(x)
-    outputs = tf.keras.layers.Dense(input_dim, activation="linear", name="reconstruction")(x)
-
-    autoencoder = tf.keras.Model(inputs=inputs, outputs=outputs, name="autoencoder")
-    encoder = tf.keras.Model(inputs=inputs, outputs=latent, name="encoder")
-
-    autoencoder.compile(optimizer="adam", loss="mse")
-    return autoencoder, encoder
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    except Exception:
+        pass
 
 
-def build_dec_model(encoder: tf.keras.Model, n_clusters: int):
-    """
-    DEC model = encoder + clustering layer
-    """
-    inputs = encoder.input
-    latent = encoder.output
-    clustering_output = ClusteringLayer(n_clusters, name="clustering")(latent)
+def _calculate_metrics(x_embedding: np.ndarray, labels: np.ndarray):
+    unique_labels = set(labels)
 
-    dec_model = tf.keras.Model(inputs=inputs, outputs=clustering_output, name="DEC")
-    dec_model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-        loss="kld",
-    )
-    return dec_model
-
-
-def prepare_features_for_dec(features_df: pd.DataFrame):
-    numeric_df = features_df.select_dtypes(include="number").copy()
-
-    scaler = StandardScaler()
-    x_scaled = scaler.fit_transform(numeric_df)
-
-    return numeric_df, x_scaled, scaler
-
-
-def _safe_cluster_metrics(x_scaled: np.ndarray, labels: np.ndarray):
-    unique_labels = pd.Series(labels).nunique()
-
-    if unique_labels < 2:
+    if len(unique_labels) <= 1:
         return {
             "silhouette_score": None,
             "calinski_harabasz_score": None,
@@ -113,92 +43,163 @@ def _safe_cluster_metrics(x_scaled: np.ndarray, labels: np.ndarray):
         }
 
     return {
-        "silhouette_score": silhouette_score(x_scaled, labels),
-        "calinski_harabasz_score": calinski_harabasz_score(x_scaled, labels),
-        "davies_bouldin_score": davies_bouldin_score(x_scaled, labels),
+        "silhouette_score": silhouette_score(x_embedding, labels),
+        "calinski_harabasz_score": calinski_harabasz_score(x_embedding, labels),
+        "davies_bouldin_score": davies_bouldin_score(x_embedding, labels),
     }
 
 
 def run_deep_embedding_clustering(
     features_df: pd.DataFrame,
     n_clusters: int = 4,
-    latent_dim: int = 10,
-    pretrain_epochs: int = 50,
-    dec_max_iter: int = 2000,
-    update_interval: int = 50,
-    batch_size: int = 32,
-    tol: float = 1e-3,
+    embedding_dim: int = 2,
+    hidden_dim: int = 32,
+    pretrain_epochs: int = 30,
+    batch_size: int = 64,
+    learning_rate: float = 1e-3,
     random_state: int = 42,
 ):
     """
-    DEC для обычных признаков.
-    1) Масштабирование признаков
-    2) Предобучение автоэнкодера
-    3) KMeans в latent space
-    4) DEC refinement
-    """
-    tf.keras.utils.set_random_seed(random_state)
+    Упрощённый Deep Embedding Clustering.
 
-    numeric_df, x_scaled, scaler = prepare_features_for_dec(features_df)
+    Этапы:
+    1. Берём общий набор признаков из cluster_features.py.
+    2. Стандартизируем признаки.
+    3. Обучаем автоэнкодер.
+    4. Получаем embedding-представление студентов.
+    5. Запускаем KMeans в embedding-пространстве.
+    6. Интерпретируем кластеры по исходным признакам.
+    """
+    try:
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+        from torch.utils.data import DataLoader, TensorDataset
+    except ImportError as exc:
+        raise ImportError(
+            "Для DEC нужен PyTorch. Установите его командой: pip install torch"
+        ) from exc
+
+    _set_seed(random_state)
+
+    numeric_df, x_scaled, scaler = prepare_cluster_matrix(features_df)
+
+    x_scaled = np.asarray(x_scaled, dtype=np.float32)
+
     input_dim = x_scaled.shape[1]
 
-    autoencoder, encoder = build_autoencoder(input_dim=input_dim, latent_dim=latent_dim)
+    if input_dim < 2:
+        embedding_dim = 1
+    elif embedding_dim >= input_dim:
+        embedding_dim = max(2, min(embedding_dim, input_dim - 1))
 
-    # Предобучение автоэнкодера
-    history = autoencoder.fit(
-        x_scaled,
-        x_scaled,
-        epochs=pretrain_epochs,
-        batch_size=batch_size,
-        shuffle=True,
-        verbose=0,
+    if n_clusters >= len(features_df):
+        n_clusters = max(2, len(features_df) - 1)
+
+    class Autoencoder(nn.Module):
+        def __init__(self, input_dim: int, hidden_dim: int, embedding_dim: int):
+            super().__init__()
+
+            self.encoder = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, embedding_dim),
+            )
+
+            self.decoder = nn.Sequential(
+                nn.Linear(embedding_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, input_dim),
+            )
+
+        def forward(self, x):
+            z = self.encoder(x)
+            x_reconstructed = self.decoder(z)
+            return x_reconstructed, z
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = Autoencoder(
+        input_dim=input_dim,
+        hidden_dim=hidden_dim,
+        embedding_dim=embedding_dim,
+    ).to(device)
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=learning_rate,
     )
 
-    z = encoder.predict(x_scaled, verbose=0)
+    x_tensor = torch.tensor(x_scaled, dtype=torch.float32)
 
-    # Инициализация центров через KMeans
-    kmeans = KMeans(n_clusters=n_clusters, n_init="auto", random_state=random_state)
-    y_pred = kmeans.fit_predict(z)
-    cluster_centers = kmeans.cluster_centers_
+    dataset = TensorDataset(x_tensor)
 
-    # DEC model
-    dec_model = build_dec_model(encoder, n_clusters=n_clusters)
-    dec_model.get_layer(name="clustering").set_weights([cluster_centers])
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+    )
 
-    index_array = np.arange(x_scaled.shape[0])
-    y_pred_last = np.copy(y_pred)
+    pretrain_losses = []
 
-    for ite in range(dec_max_iter):
-        if ite % update_interval == 0:
-            q = dec_model.predict(x_scaled, verbose=0)
-            p = target_distribution(q)
+    model.train()
 
-            y_pred = q.argmax(axis=1)
-            delta_label = np.mean(y_pred != y_pred_last)
-            y_pred_last = np.copy(y_pred)
+    for _ in range(pretrain_epochs):
+        epoch_losses = []
 
-            if ite > 0 and delta_label < tol:
-                break
+        for (batch_x,) in dataloader:
+            batch_x = batch_x.to(device)
 
-        # train on one batch
-        batch_idx = index_array[(ite * batch_size) % x_scaled.shape[0]: ((ite + 1) * batch_size) % x_scaled.shape[0]]
+            optimizer.zero_grad()
 
-        if len(batch_idx) == 0:
-            batch_idx = index_array[:batch_size]
+            x_reconstructed, _ = model(batch_x)
 
-        x_batch = x_scaled[batch_idx]
-        p_batch = p[batch_idx]
+            loss = F.mse_loss(x_reconstructed, batch_x)
 
-        dec_model.train_on_batch(x_batch, p_batch)
+            loss.backward()
+            optimizer.step()
 
-    # Финальные предсказания
-    q_final = dec_model.predict(x_scaled, verbose=0)
-    labels = q_final.argmax(axis=1)
-    confidence = q_final.max(axis=1)
+            epoch_losses.append(loss.item())
+
+        pretrain_losses.append(float(np.mean(epoch_losses)))
+
+    model.eval()
+
+    with torch.no_grad():
+        _, z_tensor = model(x_tensor.to(device))
+
+    embedding = z_tensor.cpu().numpy()
+
+    kmeans = KMeans(
+        n_clusters=n_clusters,
+        random_state=random_state,
+        n_init=10,
+    )
+
+    labels = kmeans.fit_predict(embedding)
+
+    distances = kmeans.transform(embedding)
+
+    min_distances = distances.min(axis=1)
+
+    max_distance = min_distances.max()
+
+    if max_distance > 0:
+        cluster_probability = 1 - (min_distances / max_distance)
+    else:
+        cluster_probability = np.ones(len(min_distances))
 
     result_df = features_df.copy()
     result_df["cluster"] = labels
-    result_df["dec_confidence"] = confidence
+    result_df["cluster_probability"] = cluster_probability
+
+    for dim_idx in range(embedding.shape[1]):
+        result_df[f"embedding_{dim_idx + 1}"] = embedding[:, dim_idx]
+
+    metrics = _calculate_metrics(
+        x_embedding=embedding,
+        labels=labels,
+    )
 
     cluster_profiles = (
         result_df.groupby("cluster")
@@ -206,52 +207,63 @@ def run_deep_embedding_clustering(
         .reset_index()
     )
 
-    metrics = _safe_cluster_metrics(x_scaled, labels)
-    metrics["n_clusters"] = int(n_clusters)
-    metrics["cluster_count"] = int(pd.Series(labels).nunique())
-    metrics["pretrain_loss_final"] = float(history.history["loss"][-1])
+    history = DECTrainingHistory(
+        pretrain_losses=pretrain_losses,
+    )
 
     return {
         "result_df": result_df,
         "metrics": metrics,
         "cluster_profiles": cluster_profiles,
-        "autoencoder": autoencoder,
-        "encoder": encoder,
-        "dec_model": dec_model,
+        "model": model,
         "scaler": scaler,
-        "latent_features": z,
+        "used_features": list(numeric_df.columns),
+        "embedding_dim": embedding_dim,
+        "hidden_dim": hidden_dim,
+        "n_clusters": n_clusters,
+        "history": history,
     }
 
 
 def evaluate_dec_range(
     features_df: pd.DataFrame,
     k_min: int = 2,
-    k_max: int = 6,
-    latent_dim: int = 10,
-    pretrain_epochs: int = 30,
-    dec_max_iter: int = 800,
-    batch_size: int = 32,
+    k_max: int = 8,
+    embedding_dim: int = 2,
+    hidden_dim: int = 32,
+    pretrain_epochs: int = 15,
     random_state: int = 42,
 ):
+    """
+    Быстрая оценка DEC для разных k.
+    """
     rows = []
 
     for k in range(k_min, k_max + 1):
+        if k >= len(features_df):
+            continue
+
         result = run_deep_embedding_clustering(
             features_df=features_df,
             n_clusters=k,
-            latent_dim=latent_dim,
+            embedding_dim=embedding_dim,
+            hidden_dim=hidden_dim,
             pretrain_epochs=pretrain_epochs,
-            dec_max_iter=dec_max_iter,
-            batch_size=batch_size,
             random_state=random_state,
         )
 
-        rows.append({
-            "k": k,
-            "silhouette_score": result["metrics"]["silhouette_score"],
-            "calinski_harabasz_score": result["metrics"]["calinski_harabasz_score"],
-            "davies_bouldin_score": result["metrics"]["davies_bouldin_score"],
-            "pretrain_loss_final": result["metrics"]["pretrain_loss_final"],
-        })
+        metrics = result["metrics"]
+
+        rows.append(
+            {
+                "k": k,
+                "embedding_dim": embedding_dim,
+                "hidden_dim": hidden_dim,
+                "silhouette_score": metrics["silhouette_score"],
+                "calinski_harabasz_score": metrics["calinski_harabasz_score"],
+                "davies_bouldin_score": metrics["davies_bouldin_score"],
+                "used_features": ", ".join(result["used_features"]),
+            }
+        )
 
     return pd.DataFrame(rows)

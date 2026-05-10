@@ -1,150 +1,333 @@
 import pandas as pd
 
 
-def _safe_mean(df: pd.DataFrame, col: str, default: float = 0.0) -> float:
-    if col not in df.columns:
-        return default
-    value = df[col].mean()
+TARGET_CLUSTER_NAMES = {
+    "complex": "Комплексное изучение курса",
+    "lecture": "Лекционно-ориентированная стратегия",
+    "video": "Видеолекционная стратегия",
+    "practice_test": "Контрольно-практическая стратегия",
+    "low_activity": "Низкая учебная активность",
+    "episodic": "Эпизодическая активность",
+    "mixed": "Смешанный профиль",
+}
+
+
+def _safe_float(row: pd.Series, col: str, default: float = 0.0) -> float:
+    value = row.get(col, default)
+
     if pd.isna(value):
         return default
+
     return float(value)
 
 
-def _level(cluster_value: float, global_value: float) -> str:
+def _activity_level(
+    total_events: float,
+    active_days: float,
+    global_means: dict,
+) -> str:
     """
-    Определяет уровень признака относительно общей выборки.
+    Оценивает общий уровень активности кластера.
     """
-    if abs(global_value) < 1e-9:
-        if abs(cluster_value) < 1e-9:
-            return "medium"
-        return "high"
+    global_total_events = float(global_means.get("total_events", 0))
+    global_active_days = float(global_means.get("active_days", 0))
 
-    ratio = cluster_value / global_value
+    if global_total_events <= 0:
+        return "средний"
 
-    if ratio >= 1.3:
-        return "high"
-    if ratio <= 0.7:
-        return "low"
-    return "medium"
+    if (
+        total_events >= global_total_events * 1.3
+        and active_days >= max(1, global_active_days)
+    ):
+        return "высокий"
+
+    if (
+        total_events <= global_total_events * 0.4
+        or active_days <= max(1, global_active_days * 0.4)
+    ):
+        return "низкий"
+
+    return "средний"
+
+
+def _regularity_description(
+    weekly_regularity_cv: float,
+    long_pauses_over_3d: float,
+) -> str:
+    """
+    Даёт текстовое описание регулярности.
+
+    weekly_regularity_cv:
+    - низкое значение — более равномерная активность;
+    - высокое значение — более рывковая активность.
+    """
+    if long_pauses_over_3d >= 2:
+        return "наблюдаются длительные паузы более 3 дней"
+
+    if weekly_regularity_cv <= 0.7:
+        return "активность относительно регулярная"
+
+    if weekly_regularity_cv >= 1.5:
+        return "активность выражена рывками"
+
+    return "активность умеренно неравномерная"
 
 
 def suggest_cluster_name(cluster_row: pd.Series, global_means: dict) -> tuple[str, str]:
     """
-    Возвращает:
-    - краткое название кластера
-    - краткое обоснование
+    Интерпретирует кластер по признакам:
+    - тип используемых ресурсов;
+    - общий уровень активности;
+    - регулярность взаимодействия с курсом.
     """
+    # ------------------------------------------------------------
+    # Типы учебной активности
+    # ------------------------------------------------------------
+    video_share = _safe_float(cluster_row, "video_share")
+    lecture_share = _safe_float(cluster_row, "lecture_share")
+    practice_share = _safe_float(cluster_row, "practice_share")
+    test_share = _safe_float(cluster_row, "test_share")
+    page_share = _safe_float(cluster_row, "page_share")
+    study_material_share = _safe_float(cluster_row, "study_material_share")
+    control_activity_share = _safe_float(cluster_row, "control_activity_share")
 
-    total_events = float(cluster_row.get("total_events", 0))
-    active_days = float(cluster_row.get("active_days", 0))
-    sessions_count = float(cluster_row.get("sessions_count", 0))
-    avg_events_per_session = float(cluster_row.get("avg_events_per_session", 0))
-    weekly_regularity_cv = float(cluster_row.get("weekly_regularity_cv", 0))
-    night_activity_ratio = float(cluster_row.get("night_activity_ratio", 0))
-    long_pauses_over_1d = float(cluster_row.get("long_pauses_over_1d", 0))
+    used_video = _safe_float(cluster_row, "used_video")
+    used_lecture = _safe_float(cluster_row, "used_lecture")
+    used_practice = _safe_float(cluster_row, "used_practice")
+    used_test = _safe_float(cluster_row, "used_test")
+    used_page = _safe_float(cluster_row, "used_page")
 
-    activity_level = _level(total_events, global_means.get("total_events", 0))
-    days_level = _level(active_days, global_means.get("active_days", 0))
-    sessions_level = _level(sessions_count, global_means.get("sessions_count", 0))
-    intensity_level = _level(avg_events_per_session, global_means.get("avg_events_per_session", 0))
-    regularity_level = _level(weekly_regularity_cv, global_means.get("weekly_regularity_cv", 0))
-    night_level = _level(night_activity_ratio, global_means.get("night_activity_ratio", 0))
-    pauses_level = _level(long_pauses_over_1d, global_means.get("long_pauses_over_1d", 0))
+    material_diversity_count = _safe_float(cluster_row, "material_diversity_count")
+    full_course_activity = _safe_float(cluster_row, "full_course_activity")
+    practice_test_without_materials = _safe_float(
+        cluster_row,
+        "practice_test_without_materials",
+    )
 
-    # 1. Систематические
+    # ------------------------------------------------------------
+    # Общая активность
+    # ------------------------------------------------------------
+    total_events = _safe_float(cluster_row, "total_events")
+    active_days = _safe_float(cluster_row, "active_days")
+    active_weeks = _safe_float(cluster_row, "active_weeks")
+    sessions_count = _safe_float(cluster_row, "sessions_count")
+    unique_activities = _safe_float(cluster_row, "unique_activities")
+
+    # ------------------------------------------------------------
+    # Регулярность
+    # ------------------------------------------------------------
+    weekly_regularity_cv = _safe_float(cluster_row, "weekly_regularity_cv")
+    long_pauses_over_3d = _safe_float(cluster_row, "long_pauses_over_3d")
+
+    level = _activity_level(
+        total_events=total_events,
+        active_days=active_days,
+        global_means=global_means,
+    )
+
+    regularity_text = _regularity_description(
+        weekly_regularity_cv=weekly_regularity_cv,
+        long_pauses_over_3d=long_pauses_over_3d,
+    )
+
+    behavior_text = (
+        f" Уровень активности: {level}. "
+        f"В среднем событий: {total_events:.1f}, "
+        f"активных дней: {active_days:.1f}, "
+        f"активных недель: {active_weeks:.1f}, "
+        f"сессий: {sessions_count:.1f}. "
+        f"{regularity_text}."
+    )
+
+    global_total_events = float(global_means.get("total_events", 0))
+    global_active_days = float(global_means.get("active_days", 0))
+
+    # ------------------------------------------------------------
+    # 1. Низкая учебная активность
+    # ------------------------------------------------------------
     if (
-        activity_level == "high"
-        and days_level == "high"
-        and sessions_level == "high"
-        and regularity_level == "low"
+        total_events <= max(5, global_total_events * 0.25)
+        or active_days <= max(1, global_active_days * 0.25)
     ):
         return (
-            "Систематически активные",
-            "Высокая общая активность, много активных дней и сессий, при этом поведение относительно регулярное."
+            TARGET_CLUSTER_NAMES["low_activity"],
+            (
+                "Студенты редко взаимодействуют с курсом, имеют малое число действий "
+                "и ограниченное количество активных дней."
+                + behavior_text
+            ),
         )
 
-    # 2. Эпизодические
+    # ------------------------------------------------------------
+    # 2. Контрольно-практические подтипы
+    # ------------------------------------------------------------
+
+    # 2.1. Практические и тесты почти без изучения материалов
     if (
-        activity_level == "low"
-        and days_level == "low"
-        and sessions_level == "low"
+            practice_test_without_materials >= 0.5
+            or (
+            control_activity_share >= 0.90
+            and study_material_share <= 0.03
+    )
     ):
         return (
-            "Эпизодические",
-            "Низкая активность, мало активных дней и небольшое число сессий."
+            "Практико-тестовая стратегия без изучения материалов",
+            (
+                    "Основная активность почти полностью связана с практическими заданиями "
+                    "и тестами. Обращение к лекциям, видеолекциям и страницам курса минимально. "
+                    "Такой профиль может указывать на прохождение курса преимущественно через "
+                    "контрольные активности без предварительного изучения материалов."
+                    + behavior_text
+            ),
         )
 
-    # 3. Рывковые интенсивные
+    # 2.2. Активная практико-тестовая стратегия с обращением к лекциям
     if (
-        activity_level == "high"
-        and intensity_level == "high"
-        and (days_level in ["low", "medium"])
-        and regularity_level == "high"
+            control_activity_share >= 0.75
+            and study_material_share >= 0.10
+            and active_days >= global_active_days
     ):
         return (
-            "Рывково-интенсивные",
-            "Высокая активность концентрируется в отдельных интенсивных сессиях, при этом поведение менее регулярное."
+            "Активная практико-тестовая стратегия с изучением лекций",
+            (
+                    "Студенты активно выполняют практические задания и проходят тесты, "
+                    "но также заметно обращаются к лекционным материалам Moodle. "
+                    "Профиль отличается высоким числом событий, активных дней и сессий."
+                    + behavior_text
+            ),
         )
 
-    # 4. Нерегулярные / хаотичные
+    # 2.3. Умеренная практико-тестовая стратегия
     if (
-        regularity_level == "high"
-        and pauses_level == "high"
+            control_activity_share >= 0.75
+            and study_material_share < 0.10
     ):
         return (
-            "Нерегулярные",
-            "Для кластера характерны большие паузы и выраженная неравномерность активности."
+            "Умеренная практико-тестовая стратегия",
+            (
+                    "Основная активность связана с тестами и практическими заданиями. "
+                    "Учебные материалы используются редко и выполняют вспомогательную роль."
+                    + behavior_text
+            ),
         )
 
-    # 5. Ночные активные
-    if night_level == "high" and activity_level in ["medium", "high"]:
+    # 2.4. Общая контрольно-практическая стратегия
+    if control_activity_share >= 0.75:
         return (
-            "Ночно-активные",
-            "Кластер отличается повышенной долей ночной активности."
+            TARGET_CLUSTER_NAMES["practice_test"],
+            (
+                    "Основная активность связана с практическими заданиями и тестами. "
+                    "Обращение к учебным материалам выражено слабее, чем контрольная активность."
+                    + behavior_text
+            ),
         )
 
-    # 6. Умеренно активные
+    # ------------------------------------------------------------
+    # 3. Комплексное изучение курса
+    # ------------------------------------------------------------
     if (
-        activity_level == "medium"
-        and days_level == "medium"
-        and sessions_level == "medium"
+        full_course_activity >= 0.5
+        or (
+            used_video >= 0.5
+            and used_lecture >= 0.5
+            and used_practice >= 0.5
+            and used_test >= 0.5
+        )
+        or (
+            material_diversity_count >= 2.5
+            and study_material_share > 0
+            and control_activity_share > 0
+        )
     ):
         return (
-            "Умеренно активные",
-            "Показатели активности и вовлечённости близки к средним по выборке."
+            TARGET_CLUSTER_NAMES["complex"],
+            (
+                "Студенты используют разные элементы курса: видеолекции, лекции Moodle, "
+                "страницы, практические задания и тесты. Такой профиль отражает "
+                "комплексное изучение курса."
+                + behavior_text
+            ),
         )
 
-    # 7. Если кластер активный, но без яркого паттерна
-    if activity_level == "high":
+    # ------------------------------------------------------------
+    # 4. Видеолекционная стратегия
+    # ------------------------------------------------------------
+    if (
+        used_video >= 0.5
+        and video_share >= lecture_share
+        and video_share >= practice_share
+        and video_share >= test_share
+    ):
         return (
-            "Активные",
-            "Кластер демонстрирует активность выше средней, но без ярко выраженного специализированного паттерна."
+            TARGET_CLUSTER_NAMES["video"],
+            (
+                "Основная доля учебной активности связана с видеолекциями. "
+                "Остальные элементы курса используются как дополнительные."
+                + behavior_text
+            ),
         )
 
-    # 8. Если кластер слабый по активности
-    if activity_level == "low":
+    # ------------------------------------------------------------
+    # 5. Лекционно-ориентированная стратегия
+    # ------------------------------------------------------------
+    if (
+        used_lecture >= 0.5
+        and lecture_share >= video_share
+        and lecture_share >= practice_share
+        and lecture_share >= test_share
+    ):
         return (
-            "Слабоактивные",
-            "Для кластера характерна активность ниже средней."
+            TARGET_CLUSTER_NAMES["lecture"],
+            (
+                "Студенты преимущественно используют лекционные материалы Moodle. "
+                "Видеолекции, практические задания и тесты не являются доминирующим "
+                "типом активности."
+                + behavior_text
+            ),
         )
 
+    # ------------------------------------------------------------
+    # 6. Эпизодическая активность
+    # ------------------------------------------------------------
+    if (
+        long_pauses_over_3d >= 2
+        or weekly_regularity_cv >= 1.5
+    ):
+        return (
+            TARGET_CLUSTER_NAMES["episodic"],
+            (
+                "Студенты взаимодействуют с курсом нерегулярно: активность проявляется "
+                "отдельными всплесками или сопровождается длительными паузами."
+                + behavior_text
+            ),
+        )
+
+    # ------------------------------------------------------------
+    # 7. Смешанный профиль
+    # ------------------------------------------------------------
     return (
-        "Смешанный профиль",
-        "Кластер сочетает признаки нескольких поведенческих стратегий и не имеет одного ярко выраженного паттерна."
+        TARGET_CLUSTER_NAMES["mixed"],
+        (
+            "Кластер не имеет одного явно доминирующего типа учебной активности. "
+            "Студенты используют несколько элементов курса, но без выраженного "
+            "преобладания одного ресурса."
+            + behavior_text
+        ),
     )
 
 
-def build_cluster_names(result_df: pd.DataFrame, cluster_profiles: pd.DataFrame) -> pd.DataFrame:
+def build_cluster_names(
+    result_df: pd.DataFrame,
+    cluster_profiles: pd.DataFrame,
+) -> pd.DataFrame:
     """
     Формирует таблицу с названиями и описаниями кластеров.
     """
     global_means = {
-        col: _safe_mean(result_df, col)
+        col: float(result_df[col].mean())
         for col in result_df.select_dtypes(include="number").columns
         if col != "cluster"
     }
-
-    rows = []
 
     cluster_sizes = (
         result_df.groupby("cluster")
@@ -152,17 +335,79 @@ def build_cluster_names(result_df: pd.DataFrame, cluster_profiles: pd.DataFrame)
         .reset_index(name="cluster_size")
     )
 
-    profiles_with_size = cluster_profiles.merge(cluster_sizes, on="cluster", how="left")
+    profiles_with_size = cluster_profiles.merge(
+        cluster_sizes,
+        on="cluster",
+        how="left",
+    )
+
+    rows = []
 
     for _, row in profiles_with_size.iterrows():
         cluster_id = int(row["cluster"])
         suggested_name, description = suggest_cluster_name(row, global_means)
 
-        rows.append({
-            "cluster": cluster_id,
-            "cluster_size": int(row["cluster_size"]),
-            "suggested_name": suggested_name,
-            "description": description,
-        })
+        rows.append(
+            {
+                "cluster": cluster_id,
+                "cluster_size": int(row["cluster_size"]),
+                "suggested_name": suggested_name,
+                "description": description,
+
+                # Доли активности
+                "video_share": round(float(row.get("video_share", 0)), 3),
+                "lecture_share": round(float(row.get("lecture_share", 0)), 3),
+                "practice_share": round(float(row.get("practice_share", 0)), 3),
+                "test_share": round(float(row.get("test_share", 0)), 3),
+                "page_share": round(float(row.get("page_share", 0)), 3),
+                "study_material_share": round(
+                    float(row.get("study_material_share", 0)),
+                    3,
+                ),
+                "control_activity_share": round(
+                    float(row.get("control_activity_share", 0)),
+                    3,
+                ),
+
+                # Факт использования ресурсов
+                "used_video": round(float(row.get("used_video", 0)), 3),
+                "used_lecture": round(float(row.get("used_lecture", 0)), 3),
+                "used_practice": round(float(row.get("used_practice", 0)), 3),
+                "used_test": round(float(row.get("used_test", 0)), 3),
+                "used_page": round(float(row.get("used_page", 0)), 3),
+                "material_diversity_count": round(
+                    float(row.get("material_diversity_count", 0)),
+                    2,
+                ),
+                "full_course_activity": round(
+                    float(row.get("full_course_activity", 0)),
+                    3,
+                ),
+                "practice_test_without_materials": round(
+                    float(row.get("practice_test_without_materials", 0)),
+                    3,
+                ),
+
+                # Общая активность
+                "total_events": round(float(row.get("total_events", 0)), 2),
+                "active_days": round(float(row.get("active_days", 0)), 2),
+                "active_weeks": round(float(row.get("active_weeks", 0)), 2),
+                "sessions_count": round(float(row.get("sessions_count", 0)), 2),
+                "unique_activities": round(
+                    float(row.get("unique_activities", 0)),
+                    2,
+                ),
+
+                # Регулярность
+                "weekly_regularity_cv": round(
+                    float(row.get("weekly_regularity_cv", 0)),
+                    3,
+                ),
+                "long_pauses_over_3d": round(
+                    float(row.get("long_pauses_over_3d", 0)),
+                    2,
+                ),
+            }
+        )
 
     return pd.DataFrame(rows).sort_values("cluster").reset_index(drop=True)

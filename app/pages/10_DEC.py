@@ -1,374 +1,555 @@
-import random
-from dataclasses import dataclass
-
-import numpy as np
 import pandas as pd
+import plotly.express as px
+import streamlit as st
 
-from sklearn.cluster import KMeans
-from sklearn.metrics import (
-    silhouette_score,
-    calinski_harabasz_score,
-    davies_bouldin_score,
+from src.state import init_session_state
+from src.deep_embedding_clustering import (
+    run_deep_embedding_clustering,
+    evaluate_dec_range,
+)
+from src.cluster_naming import build_cluster_names
+from src.visualization import (
+    plot_cluster_counts,
+    plot_pca_clusters,
+    plot_cluster_profile_bar,
+)
+from src.ui_styles import apply_global_styles
+
+from src.cluster_name_editor import render_editable_cluster_names
+
+st.set_page_config(
+    page_title="DEC",
+    layout="wide",
 )
 
-from src.cluster_features import prepare_cluster_matrix
+init_session_state()
+apply_global_styles()
 
 
-@dataclass
-class DECTrainingHistory:
-    pretrain_losses: list[float]
-    clustering_losses: list[float]
+st.title("Deep Embedding Clustering")
+
+st.write(
+    "Deep Embedding Clustering используется как дополнительный экспериментальный метод. "
+    "Сначала автоэнкодер строит скрытое представление студентов, затем KMeans выполняет "
+    "кластеризацию в embedding-пространстве."
+)
 
 
-def _set_seed(seed: int = 42):
-    random.seed(seed)
-    np.random.seed(seed)
-
-    try:
-        import torch
-
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    except Exception:
-        pass
-
-
-def _calculate_metrics(x_embedding: np.ndarray, labels: np.ndarray):
-    unique_labels = set(labels)
-
-    if len(unique_labels) <= 1:
-        return {
-            "silhouette_score": None,
-            "calinski_harabasz_score": None,
-            "davies_bouldin_score": None,
-        }
-
-    return {
-        "silhouette_score": silhouette_score(x_embedding, labels),
-        "calinski_harabasz_score": calinski_harabasz_score(x_embedding, labels),
-        "davies_bouldin_score": davies_bouldin_score(x_embedding, labels),
-    }
-
-
-def _target_distribution(q):
-    """
-    Target distribution из DEC.
-
-    q — мягкие вероятности принадлежности к кластерам.
-    """
-    weight = (q**2) / q.sum(axis=0)
-    return (weight.T / weight.sum(axis=1)).T
-
-
-def run_deep_embedding_clustering(
-    features_df: pd.DataFrame,
-    n_clusters: int = 4,
-    embedding_dim: int = 2,
-    hidden_dim: int = 64,
-    pretrain_epochs: int = 100,
-    clustering_epochs: int = 50,
-    batch_size: int = 64,
-    learning_rate: float = 1e-3,
-    random_state: int = 42,
+def build_student_cluster_comparison(
+    result_df: pd.DataFrame,
+    student_id: str,
 ):
-    """
-    Deep Embedding Clustering.
+    student_row = result_df[
+        result_df["student_id"].astype(str) == str(student_id)
+    ].copy()
 
-    Этапы:
-    1. Берём единый набор признаков через cluster_features.py.
-    2. Стандартизируем признаки.
-    3. Обучаем автоэнкодер восстанавливать исходные признаки.
-    4. Получаем embedding-представление студентов.
-    5. Запускаем KMeans в embedding-пространстве.
-    6. Выполняем несколько эпох DEC-уточнения.
-    7. Интерпретируем кластеры по исходным признакам, а не по embedding.
+    if student_row.empty:
+        raise ValueError("Выбранный студент не найден.")
 
-    Важно:
-    DEC используется как дополнительный экспериментальный метод.
-    """
-    try:
-        import torch
-        import torch.nn as nn
-        import torch.nn.functional as F
-        from torch.utils.data import DataLoader, TensorDataset
-    except ImportError as exc:
-        raise ImportError(
-            "Для Deep Embedding Clustering нужен PyTorch. "
-            "Установите его командой: pip install torch"
-        ) from exc
+    cluster_id = int(student_row["cluster"].iloc[0])
 
-    _set_seed(random_state)
+    cluster_df = result_df[result_df["cluster"] == cluster_id].copy()
 
-    numeric_df, x_scaled, scaler = prepare_cluster_matrix(features_df)
+    numeric_cols = [
+        col
+        for col in result_df.select_dtypes(include="number").columns
+        if col != "cluster"
+    ]
 
-    x_scaled = np.asarray(x_scaled, dtype=np.float32)
-
-    input_dim = x_scaled.shape[1]
-
-    if embedding_dim >= input_dim:
-        embedding_dim = max(2, input_dim // 2)
-
-    class Autoencoder(nn.Module):
-        def __init__(self, input_dim: int, hidden_dim: int, embedding_dim: int):
-            super().__init__()
-
-            self.encoder = nn.Sequential(
-                nn.Linear(input_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, embedding_dim),
-            )
-
-            self.decoder = nn.Sequential(
-                nn.Linear(embedding_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, input_dim),
-            )
-
-        def forward(self, x):
-            z = self.encoder(x)
-            x_reconstructed = self.decoder(z)
-            return x_reconstructed, z
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    model = Autoencoder(
-        input_dim=input_dim,
-        hidden_dim=hidden_dim,
-        embedding_dim=embedding_dim,
-    ).to(device)
-
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=learning_rate,
-    )
-
-    x_tensor = torch.tensor(x_scaled, dtype=torch.float32)
-    dataset = TensorDataset(x_tensor)
-
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-    )
-
-    pretrain_losses = []
-
-    # ------------------------------------------------------------
-    # 1. Предобучение автоэнкодера
-    # ------------------------------------------------------------
-    model.train()
-
-    for _ in range(pretrain_epochs):
-        epoch_losses = []
-
-        for (batch_x,) in dataloader:
-            batch_x = batch_x.to(device)
-
-            optimizer.zero_grad()
-
-            x_reconstructed, _ = model(batch_x)
-
-            loss = F.mse_loss(x_reconstructed, batch_x)
-
-            loss.backward()
-            optimizer.step()
-
-            epoch_losses.append(loss.item())
-
-        pretrain_losses.append(float(np.mean(epoch_losses)))
-
-    # ------------------------------------------------------------
-    # 2. Получение embedding после предобучения
-    # ------------------------------------------------------------
-    model.eval()
-
-    with torch.no_grad():
-        _, z_tensor = model(x_tensor.to(device))
-
-    z = z_tensor.cpu().numpy()
-
-    # ------------------------------------------------------------
-    # 3. Инициализация центров кластеров через KMeans
-    # ------------------------------------------------------------
-    kmeans = KMeans(
-        n_clusters=n_clusters,
-        random_state=random_state,
-        n_init=10,
-    )
-
-    labels = kmeans.fit_predict(z)
-    cluster_centers = kmeans.cluster_centers_
-
-    cluster_centers_tensor = torch.tensor(
-        cluster_centers,
-        dtype=torch.float32,
-        device=device,
-    )
-
-    cluster_centers_parameter = torch.nn.Parameter(cluster_centers_tensor)
-
-    dec_optimizer = torch.optim.Adam(
-        list(model.encoder.parameters()) + [cluster_centers_parameter],
-        lr=learning_rate,
-    )
-
-    clustering_losses = []
-
-    # ------------------------------------------------------------
-    # 4. DEC-уточнение embedding-пространства
-    # ------------------------------------------------------------
-    alpha = 1.0
-
-    for _ in range(clustering_epochs):
-        model.train()
-
-        x_all = x_tensor.to(device)
-
-        z_all = model.encoder(x_all)
-
-        # Student t-distribution
-        distances = torch.sum(
-            (z_all.unsqueeze(1) - cluster_centers_parameter.unsqueeze(0)) ** 2,
-            dim=2,
-        )
-
-        q = 1.0 / (1.0 + distances / alpha)
-        q = q ** ((alpha + 1.0) / 2.0)
-        q = q / torch.sum(q, dim=1, keepdim=True)
-
-        q_np = q.detach().cpu().numpy()
-        p_np = _target_distribution(q_np)
-
-        p = torch.tensor(
-            p_np,
-            dtype=torch.float32,
-            device=device,
-        )
-
-        dec_optimizer.zero_grad()
-
-        loss = F.kl_div(
-            torch.log(q + 1e-10),
-            p,
-            reduction="batchmean",
-        )
-
-        loss.backward()
-        dec_optimizer.step()
-
-        clustering_losses.append(float(loss.item()))
-
-    # ------------------------------------------------------------
-    # 5. Финальные embedding и кластеры
-    # ------------------------------------------------------------
-    model.eval()
-
-    with torch.no_grad():
-        final_z_tensor = model.encoder(x_tensor.to(device))
-
-        distances = torch.sum(
-            (
-                final_z_tensor.unsqueeze(1)
-                - cluster_centers_parameter.unsqueeze(0)
-            )
-            ** 2,
-            dim=2,
-        )
-
-        q = 1.0 / (1.0 + distances / alpha)
-        q = q ** ((alpha + 1.0) / 2.0)
-        q = q / torch.sum(q, dim=1, keepdim=True)
-
-    final_embedding = final_z_tensor.cpu().numpy()
-    probabilities = q.cpu().numpy()
-    labels = probabilities.argmax(axis=1)
-
-    result_df = features_df.copy()
-    result_df["cluster"] = labels
-    result_df["cluster_probability"] = probabilities.max(axis=1)
-
-    for dim_idx in range(final_embedding.shape[1]):
-        result_df[f"embedding_{dim_idx + 1}"] = final_embedding[:, dim_idx]
-
-    for cluster_idx in range(n_clusters):
-        result_df[f"dec_probability_cluster_{cluster_idx}"] = probabilities[
-            :,
-            cluster_idx,
-        ]
-
-    metrics = _calculate_metrics(
-        x_embedding=final_embedding,
-        labels=labels,
-    )
-
-    cluster_profiles = (
-        result_df.groupby("cluster")
-        .mean(numeric_only=True)
-        .reset_index()
-    )
-
-    history = DECTrainingHistory(
-        pretrain_losses=pretrain_losses,
-        clustering_losses=clustering_losses,
-    )
-
-    return {
-        "result_df": result_df,
-        "metrics": metrics,
-        "cluster_profiles": cluster_profiles,
-        "model": model,
-        "scaler": scaler,
-        "used_features": list(numeric_df.columns),
-        "embedding_dim": embedding_dim,
-        "hidden_dim": hidden_dim,
-        "n_clusters": n_clusters,
-        "history": history,
-    }
-
-
-def evaluate_dec_range(
-    features_df: pd.DataFrame,
-    k_min: int = 2,
-    k_max: int = 8,
-    embedding_dim: int = 2,
-    hidden_dim: int = 64,
-    pretrain_epochs: int = 50,
-    clustering_epochs: int = 20,
-    random_state: int = 42,
-):
-    """
-    Быстрая оценка DEC для разных k.
-
-    Для ускорения используется меньше эпох, чем при финальном запуске.
-    """
     rows = []
 
-    for k in range(k_min, k_max + 1):
-        if k >= len(features_df):
-            continue
+    for col in numeric_cols:
+        student_value = float(student_row[col].iloc[0])
+        cluster_mean = float(cluster_df[col].mean())
+        cluster_std = float(cluster_df[col].std(ddof=0))
 
-        result = run_deep_embedding_clustering(
-            features_df=features_df,
-            n_clusters=k,
-            embedding_dim=embedding_dim,
-            hidden_dim=hidden_dim,
-            pretrain_epochs=pretrain_epochs,
-            clustering_epochs=clustering_epochs,
-            random_state=random_state,
+        diff = student_value - cluster_mean
+
+        if abs(cluster_mean) > 1e-9:
+            relative_diff_pct = (diff / cluster_mean) * 100
+        else:
+            relative_diff_pct = 0.0
+
+        if cluster_std > 1e-9:
+            z_score = diff / cluster_std
+        else:
+            z_score = 0.0
+
+        strong_deviation = (
+            abs(z_score) >= 1.5
+            or abs(relative_diff_pct) >= 30
         )
-
-        metrics = result["metrics"]
 
         rows.append(
             {
-                "k": k,
-                "embedding_dim": embedding_dim,
-                "hidden_dim": hidden_dim,
-                "silhouette_score": metrics["silhouette_score"],
-                "calinski_harabasz_score": metrics["calinski_harabasz_score"],
-                "davies_bouldin_score": metrics["davies_bouldin_score"],
-                "used_features": ", ".join(result["used_features"]),
+                "feature": col,
+                "student_value": student_value,
+                "cluster_mean": cluster_mean,
+                "difference": diff,
+                "relative_diff_pct": relative_diff_pct,
+                "z_score": z_score,
+                "strong_deviation": strong_deviation,
             }
         )
 
-    return pd.DataFrame(rows)
+    comparison_df = pd.DataFrame(rows).sort_values(
+        by="z_score",
+        key=lambda s: s.abs(),
+        ascending=False,
+    )
+
+    return comparison_df, cluster_id
+
+
+def highlight_large_deviation(row: pd.Series):
+    if bool(row["strong_deviation"]):
+        return ["background-color: orange"] * len(row)
+
+    return [""] * len(row)
+
+
+# ------------------------------------------------------------
+# Данные
+# ------------------------------------------------------------
+features_df_for_clustering = st.session_state.get("features_df_for_clustering")
+
+if features_df_for_clustering is None:
+    st.warning(
+        "Сначала выполните Data Preparation: загрузите лог, постройте признаки "
+        "и примените исключение не-студентов."
+    )
+    st.stop()
+
+if len(features_df_for_clustering) < 2:
+    st.error("Для кластеризации осталось слишком мало пользователей.")
+    st.stop()
+
+st.success(
+    f"Данные готовы. Пользователей для кластеризации: "
+    f"{len(features_df_for_clustering)}"
+)
+
+st.subheader("Таблица признаков для кластеризации")
+st.dataframe(
+    features_df_for_clustering.head(),
+    use_container_width=True,
+)
+
+
+# ------------------------------------------------------------
+# Оценка k
+# ------------------------------------------------------------
+st.subheader("Быстрая оценка разных k")
+
+col_k1, col_k2, col_k3 = st.columns(3)
+
+with col_k1:
+    k_min = st.number_input(
+        "Минимальное k",
+        min_value=2,
+        max_value=20,
+        value=2,
+        step=1,
+        key="dec_k_min",
+    )
+
+with col_k2:
+    k_max = st.number_input(
+        "Максимальное k",
+        min_value=2,
+        max_value=20,
+        value=6,
+        step=1,
+        key="dec_k_max",
+    )
+
+with col_k3:
+    quick_embedding_dim = st.number_input(
+        "Embedding dim для оценки",
+        min_value=2,
+        max_value=16,
+        value=2,
+        step=1,
+        key="dec_quick_embedding_dim",
+    )
+
+if st.button("Оценить DEC для разных k", key="evaluate_dec_button"):
+    if k_min >= k_max:
+        st.warning("Минимальное k должно быть меньше максимального k.")
+    else:
+        with st.spinner("Выполняется быстрая оценка DEC..."):
+            st.session_state["dec_scores_df"] = evaluate_dec_range(
+                features_df=features_df_for_clustering,
+                k_min=int(k_min),
+                k_max=min(int(k_max), len(features_df_for_clustering) - 1),
+                embedding_dim=int(quick_embedding_dim),
+                hidden_dim=32,
+                pretrain_epochs=15,
+            )
+
+if st.session_state.get("dec_scores_df") is not None:
+    st.dataframe(
+        st.session_state["dec_scores_df"],
+        use_container_width=True,
+    )
+
+
+# ------------------------------------------------------------
+# Параметры DEC
+# ------------------------------------------------------------
+st.subheader("Параметры DEC")
+
+max_possible_k = min(8, len(features_df_for_clustering))
+min_possible_k = 2
+
+numeric_features_count = len(
+    features_df_for_clustering.select_dtypes(include="number").columns
+)
+
+max_embedding_dim = max(2, min(16, numeric_features_count - 1))
+
+col_p1, col_p2, col_p3 = st.columns(3)
+
+with col_p1:
+    n_clusters = st.slider(
+        "Число кластеров",
+        min_value=min_possible_k,
+        max_value=max_possible_k,
+        value=min(4, max_possible_k),
+        step=1,
+        key="dec_n_clusters",
+    )
+
+with col_p2:
+    embedding_dim = st.slider(
+        "Размер embedding",
+        min_value=2,
+        max_value=max_embedding_dim,
+        value=2,
+        step=1,
+        key="dec_embedding_dim",
+    )
+
+with col_p3:
+    hidden_dim = st.selectbox(
+        "Размер скрытого слоя",
+        options=[16, 32, 64, 128],
+        index=1,
+        key="dec_hidden_dim",
+    )
+
+col_t1, col_t2 = st.columns(2)
+
+with col_t1:
+    pretrain_epochs = st.slider(
+        "Эпохи обучения автоэнкодера",
+        min_value=10,
+        max_value=200,
+        value=30,
+        step=10,
+        key="dec_pretrain_epochs",
+    )
+
+with col_t2:
+    learning_rate = st.selectbox(
+        "Learning rate",
+        options=[1e-2, 1e-3, 1e-4],
+        index=1,
+        format_func=lambda x: f"{x:g}",
+        key="dec_learning_rate",
+    )
+
+st.caption(
+    "Рекомендуемые параметры для первого запуска: 4 кластера, embedding_dim=2, "
+    "hidden_dim=32, epochs=30, learning_rate=0.001."
+)
+
+
+# ------------------------------------------------------------
+# Запуск DEC
+# ------------------------------------------------------------
+if st.button("Запустить Deep Embedding Clustering", key="run_dec_button"):
+    with st.spinner("Обучается автоэнкодер и выполняется кластеризация..."):
+        try:
+            st.session_state["dec_result"] = run_deep_embedding_clustering(
+                features_df=features_df_for_clustering,
+                n_clusters=int(n_clusters),
+                embedding_dim=int(embedding_dim),
+                hidden_dim=int(hidden_dim),
+                pretrain_epochs=int(pretrain_epochs),
+                learning_rate=float(learning_rate),
+            )
+        except Exception as e:
+            st.exception(e)
+
+
+# ------------------------------------------------------------
+# Результаты
+# ------------------------------------------------------------
+if st.session_state.get("dec_result") is not None:
+    dec_result = st.session_state["dec_result"]
+
+    result_df = dec_result["result_df"]
+    metrics = dec_result["metrics"]
+    cluster_profiles = dec_result["cluster_profiles"]
+    used_features = dec_result["used_features"]
+    history = dec_result["history"]
+
+    cluster_names_df = build_cluster_names(
+        result_df=result_df,
+        cluster_profiles=cluster_profiles,
+    )
+
+    cluster_names_df = render_editable_cluster_names(
+        method_key="dec",
+        cluster_names_df=cluster_names_df,
+        title="Названия кластеров DEC",
+    )
+
+    st.subheader("Метрики кластеризации")
+
+    m1, m2, m3 = st.columns(3)
+
+    silhouette = metrics.get("silhouette_score")
+    calinski = metrics.get("calinski_harabasz_score")
+    davies = metrics.get("davies_bouldin_score")
+
+    m1.metric(
+        "Silhouette",
+        "—" if silhouette is None else f"{silhouette:.4f}",
+    )
+
+    m2.metric(
+        "Calinski-Harabasz",
+        "—" if calinski is None else f"{calinski:.4f}",
+    )
+
+    m3.metric(
+        "Davies-Bouldin",
+        "—" if davies is None else f"{davies:.4f}",
+    )
+
+    st.subheader("Использованные признаки")
+    st.write(used_features)
+
+    # ------------------------------------------------------------
+    # Loss автоэнкодера
+    # ------------------------------------------------------------
+    st.subheader("График обучения автоэнкодера")
+
+    if history.pretrain_losses:
+        loss_df = pd.DataFrame(
+            {
+                "epoch": list(range(1, len(history.pretrain_losses) + 1)),
+                "loss": history.pretrain_losses,
+            }
+        )
+
+        fig_loss = px.line(
+            loss_df,
+            x="epoch",
+            y="loss",
+            title="Autoencoder reconstruction loss",
+        )
+
+        st.plotly_chart(fig_loss, use_container_width=True)
+
+    # ------------------------------------------------------------
+    # Интерпретация кластеров
+    # ------------------------------------------------------------
+    st.subheader("Автоматические названия кластеров")
+    st.dataframe(
+        cluster_names_df,
+        use_container_width=True,
+    )
+
+    st.subheader("Студенты и их кластеры")
+
+    result_with_names = result_df.merge(
+        cluster_names_df[["cluster", "suggested_name"]],
+        on="cluster",
+        how="left",
+    )
+
+    important_columns = [
+        "student_id",
+        "cluster",
+        "suggested_name",
+        "cluster_probability",
+        "total_events",
+        "active_days",
+        "active_weeks",
+        "video_share",
+        "lecture_share",
+        "practice_share",
+        "test_share",
+        "study_material_share",
+        "control_activity_share",
+    ]
+
+    available_columns = [
+        col for col in important_columns
+        if col in result_with_names.columns
+    ]
+
+    st.dataframe(
+        result_with_names[available_columns],
+        use_container_width=True,
+    )
+
+    with st.expander("Показать полную таблицу студентов"):
+        st.dataframe(result_with_names, use_container_width=True)
+
+    st.subheader("Средние профили кластеров")
+
+    profiles_with_names = cluster_profiles.merge(
+        cluster_names_df[["cluster", "suggested_name"]],
+        on="cluster",
+        how="left",
+    )
+
+    st.dataframe(
+        profiles_with_names,
+        use_container_width=True,
+    )
+
+    # ------------------------------------------------------------
+    # Embedding-график
+    # ------------------------------------------------------------
+    st.subheader("Embedding-пространство DEC")
+
+    embedding_cols = [
+        col for col in result_with_names.columns
+        if col.startswith("embedding_")
+    ]
+
+    if len(embedding_cols) >= 2:
+        fig_embedding = px.scatter(
+            result_with_names,
+            x="embedding_1",
+            y="embedding_2",
+            color="cluster",
+            hover_data=[
+                "student_id",
+                "suggested_name",
+                "cluster_probability",
+            ],
+            title="DEC embedding-пространство",
+        )
+
+        st.plotly_chart(fig_embedding, use_container_width=True)
+    else:
+        st.info("Для 2D-графика нужно embedding_dim >= 2.")
+
+    # ------------------------------------------------------------
+    # Графики как у остальных методов
+    # ------------------------------------------------------------
+    st.subheader("Распределение студентов по кластерам")
+
+    fig_counts = plot_cluster_counts(result_df)
+    st.plotly_chart(fig_counts, use_container_width=True)
+
+    st.subheader("PCA-визуализация по исходным признакам")
+
+    pca_input_df = result_df.drop(
+        columns=[
+            col for col in result_df.columns
+            if col.startswith("embedding_")
+            or col == "cluster_probability"
+        ],
+        errors="ignore",
+    )
+
+    fig_pca, pca_df = plot_pca_clusters(pca_input_df)
+    st.plotly_chart(fig_pca, use_container_width=True)
+
+    with st.expander("Показать PCA-таблицу"):
+        st.dataframe(pca_df, use_container_width=True)
+
+    st.subheader("График среднего признака по кластерам")
+
+    available_features = [
+        col for col in cluster_profiles.columns
+        if col != "cluster"
+    ]
+
+    if available_features:
+        selected_feature = st.selectbox(
+            "Выберите признак для сравнения кластеров",
+            available_features,
+            key="selected_dec_cluster_feature",
+        )
+
+        fig_profile = plot_cluster_profile_bar(
+            cluster_profiles,
+            selected_feature,
+        )
+
+        st.plotly_chart(fig_profile, use_container_width=True)
+
+    # ------------------------------------------------------------
+    # Анализ студента
+    # ------------------------------------------------------------
+    st.subheader("Анализ выбранного студента")
+
+    student_ids = sorted(result_df["student_id"].astype(str).tolist())
+
+    selected_student_id = st.selectbox(
+        "Выберите студента",
+        student_ids,
+        key="selected_dec_student_id",
+    )
+
+    comparison_df, cluster_id = build_student_cluster_comparison(
+        result_df=result_df,
+        student_id=selected_student_id,
+    )
+
+    student_row = result_with_names[
+        result_with_names["student_id"].astype(str) == str(selected_student_id)
+    ].copy()
+
+    cluster_name = student_row["suggested_name"].iloc[0]
+    cluster_probability = student_row["cluster_probability"].iloc[0]
+
+    st.info(
+        f"Студент **{selected_student_id}** относится к кластеру "
+        f"**{cluster_id}** — **{cluster_name}**. "
+        f"Вероятность принадлежности: **{cluster_probability:.3f}**."
+    )
+
+    st.dataframe(student_row, use_container_width=True)
+
+    st.subheader("Сравнение со средним по кластеру")
+
+    show_only_strong = st.checkbox(
+        "Показать только сильно отличающиеся признаки",
+        value=False,
+        key="show_only_strong_deviation_dec",
+    )
+
+    display_df = comparison_df.copy()
+
+    if show_only_strong:
+        display_df = display_df[display_df["strong_deviation"]].copy()
+
+    if display_df.empty:
+        st.success("Сильно отличающихся признаков не найдено.")
+    else:
+        styled_display_df = display_df.style.apply(
+            highlight_large_deviation,
+            axis=1,
+        ).format(
+            {
+                "student_value": "{:.4f}",
+                "cluster_mean": "{:.4f}",
+                "difference": "{:.4f}",
+                "relative_diff_pct": "{:.2f}",
+                "z_score": "{:.2f}",
+            }
+        )
+
+        st.write(styled_display_df)
+
+else:
+    st.info("Выберите параметры и нажмите «Запустить Deep Embedding Clustering».")

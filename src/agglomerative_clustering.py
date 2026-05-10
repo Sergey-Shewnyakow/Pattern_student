@@ -1,26 +1,24 @@
 import pandas as pd
+
 from sklearn.cluster import AgglomerativeClustering
-from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
     silhouette_score,
     calinski_harabasz_score,
     davies_bouldin_score,
 )
 
-
-def prepare_features_for_agglomerative(features_df: pd.DataFrame):
-    numeric_df = features_df.select_dtypes(include="number").copy()
-
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(numeric_df)
-
-    return numeric_df, X_scaled, scaler
+from src.cluster_features import prepare_cluster_matrix
 
 
-def _safe_cluster_metrics(X_scaled, labels):
-    unique_labels = pd.Series(labels).nunique()
+def _calculate_clustering_metrics(x_scaled, labels):
+    """
+    Считает метрики качества кластеризации.
 
-    if unique_labels < 2:
+    Метрики считаются только если реально получилось больше одного кластера.
+    """
+    unique_labels = set(labels)
+
+    if len(unique_labels) <= 1:
         return {
             "silhouette_score": None,
             "calinski_harabasz_score": None,
@@ -28,58 +26,43 @@ def _safe_cluster_metrics(X_scaled, labels):
         }
 
     return {
-        "silhouette_score": silhouette_score(X_scaled, labels),
-        "calinski_harabasz_score": calinski_harabasz_score(X_scaled, labels),
-        "davies_bouldin_score": davies_bouldin_score(X_scaled, labels),
+        "silhouette_score": silhouette_score(x_scaled, labels),
+        "calinski_harabasz_score": calinski_harabasz_score(x_scaled, labels),
+        "davies_bouldin_score": davies_bouldin_score(x_scaled, labels),
     }
 
 
 def run_agglomerative(
     features_df: pd.DataFrame,
-    n_clusters: int | None = 3,
+    n_clusters: int = 4,
     linkage: str = "ward",
-    metric: str = "euclidean",
-    distance_threshold: float | None = None,
 ):
     """
-    Запускает Agglomerative Clustering:
-    - либо с фиксированным числом кластеров
-    - либо с distance_threshold
+    Запускает Agglomerative Clustering.
+
+    Метод использует тот же набор признаков, что и KMeans:
+    - типы учебной активности;
+    - общий уровень активности;
+    - регулярность.
+
+    Это позволяет сравнивать KMeans и Agglomerative между собой.
     """
-    numeric_df, X_scaled, scaler = prepare_features_for_agglomerative(features_df)
+    numeric_df, x_scaled, scaler = prepare_cluster_matrix(features_df)
 
-    if linkage == "ward":
-        metric = "euclidean"
+    model = AgglomerativeClustering(
+        n_clusters=n_clusters,
+        linkage=linkage,
+    )
 
-    if distance_threshold is not None:
-        model = AgglomerativeClustering(
-            n_clusters=None,
-            distance_threshold=distance_threshold,
-            compute_full_tree=True,
-            linkage=linkage,
-            metric=metric,
-            compute_distances=True,
-        )
-    else:
-        model = AgglomerativeClustering(
-            n_clusters=n_clusters,
-            linkage=linkage,
-            metric=metric,
-            compute_distances=True
-        )
-
-    labels = model.fit_predict(X_scaled)
+    labels = model.fit_predict(x_scaled)
 
     result_df = features_df.copy()
     result_df["cluster"] = labels
 
-    metrics = _safe_cluster_metrics(X_scaled, labels)
-    metrics["cluster_count"] = int(pd.Series(labels).nunique())
-
-    if distance_threshold is not None:
-        metrics["distance_threshold"] = float(distance_threshold)
-    else:
-        metrics["n_clusters"] = int(n_clusters)
+    metrics = _calculate_clustering_metrics(
+        x_scaled=x_scaled,
+        labels=labels,
+    )
 
     cluster_profiles = (
         result_df.groupby("cluster")
@@ -93,87 +76,86 @@ def run_agglomerative(
         "cluster_profiles": cluster_profiles,
         "model": model,
         "scaler": scaler,
+        "used_features": list(numeric_df.columns),
+        "linkage": linkage,
     }
 
 
 def evaluate_agglomerative_range(
     features_df: pd.DataFrame,
     k_min: int = 2,
-    k_max: int = 6,
+    k_max: int = 8,
     linkage: str = "ward",
-    metric: str = "euclidean"
 ):
     """
-    Оценка Agglomerative для диапазона числа кластеров.
+    Считает метрики Agglomerative Clustering для разного числа кластеров.
     """
-    numeric_df, X_scaled, _ = prepare_features_for_agglomerative(features_df)
-
-    if linkage == "ward":
-        metric = "euclidean"
+    numeric_df, x_scaled, _ = prepare_cluster_matrix(features_df)
 
     rows = []
 
     for k in range(k_min, k_max + 1):
+        if k >= len(features_df):
+            continue
+
         model = AgglomerativeClustering(
             n_clusters=k,
             linkage=linkage,
-            metric=metric
         )
-        labels = model.fit_predict(X_scaled)
 
-        metric_values = _safe_cluster_metrics(X_scaled, labels)
+        labels = model.fit_predict(x_scaled)
+
+        metrics = _calculate_clustering_metrics(
+            x_scaled=x_scaled,
+            labels=labels,
+        )
 
         row = {
             "k": k,
-            "silhouette_score": metric_values["silhouette_score"],
-            "calinski_harabasz_score": metric_values["calinski_harabasz_score"],
-            "davies_bouldin_score": metric_values["davies_bouldin_score"],
             "linkage": linkage,
-            "metric": metric,
+            "silhouette_score": metrics["silhouette_score"],
+            "calinski_harabasz_score": metrics["calinski_harabasz_score"],
+            "davies_bouldin_score": metrics["davies_bouldin_score"],
+            "used_features": ", ".join(numeric_df.columns),
         }
+
         rows.append(row)
 
     return pd.DataFrame(rows)
 
 
-def evaluate_agglomerative_thresholds(
+def compare_agglomerative_linkages(
     features_df: pd.DataFrame,
-    threshold_values: list[float],
-    linkage: str = "ward",
-    metric: str = "euclidean"
+    n_clusters: int = 4,
 ):
     """
-    Оценка Agglomerative для диапазона distance_threshold.
-    """
-    numeric_df, X_scaled, _ = prepare_features_for_agglomerative(features_df)
+    Сравнивает разные варианты linkage.
 
-    if linkage == "ward":
-        metric = "euclidean"
+    ward обычно является основным вариантом для числовых стандартизированных признаков.
+    average и complete можно использовать как проверочные варианты.
+    """
+    linkages = ["ward", "average", "complete"]
 
     rows = []
 
-    for threshold in threshold_values:
-        model = AgglomerativeClustering(
-            n_clusters=None,
-            distance_threshold=threshold,
-            compute_full_tree=True,
+    for linkage in linkages:
+        result = run_agglomerative(
+            features_df=features_df,
+            n_clusters=n_clusters,
             linkage=linkage,
-            metric=metric,
-            compute_distances=True,
         )
-        labels = model.fit_predict(X_scaled)
 
-        metric_values = _safe_cluster_metrics(X_scaled, labels)
+        metrics = result["metrics"]
 
-        row = {
-            "distance_threshold": threshold,
-            "cluster_count": int(pd.Series(labels).nunique()),
-            "silhouette_score": metric_values["silhouette_score"],
-            "calinski_harabasz_score": metric_values["calinski_harabasz_score"],
-            "davies_bouldin_score": metric_values["davies_bouldin_score"],
-            "linkage": linkage,
-            "metric": metric,
-        }
-        rows.append(row)
+        rows.append(
+            {
+                "linkage": linkage,
+                "n_clusters": n_clusters,
+                "silhouette_score": metrics["silhouette_score"],
+                "calinski_harabasz_score": metrics["calinski_harabasz_score"],
+                "davies_bouldin_score": metrics["davies_bouldin_score"],
+                "used_features": ", ".join(result["used_features"]),
+            }
+        )
 
     return pd.DataFrame(rows)

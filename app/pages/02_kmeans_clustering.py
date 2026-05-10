@@ -14,6 +14,8 @@ st.set_page_config(page_title="KMeans Clustering", layout="wide")
 init_session_state()
 
 from src.ui_styles import apply_global_styles
+from src.cluster_name_editor import render_editable_cluster_names
+
 
 apply_global_styles()
 RU_COLUMNS = {
@@ -51,6 +53,24 @@ RU_COLUMNS = {
     "final_anomaly": "Итоговая аномалия",
     "exclude_manual": "Исключено вручную",
     "exclude_final": "Итоговое исключение",
+    "video_events": "События видеолекций",
+    "notes_events": "События конспектов",
+    "presentation_events": "События презентаций",
+    "practice_events": "События практических",
+    "other_material_events": "Прочие учебные события",
+    "study_material_events": "События учебных материалов",
+    "learning_related_events": "Учебные события всего",
+    "video_share": "Доля видеолекций",
+    "notes_share": "Доля конспектов",
+    "presentation_share": "Доля презентаций",
+    "practice_share": "Доля практических",
+    "used_video": "Использовал видео",
+    "used_notes": "Использовал конспекты",
+    "used_presentation": "Использовал презентации",
+    "used_practice": "Использовал практические",
+    "material_diversity_count": "Разнообразие материалов",
+    "all_materials_used": "Использовал все материалы",
+    "practice_without_materials": "Практические без материалов",
 }
 def build_student_cluster_comparison(result_df: pd.DataFrame, student_id: str) -> tuple[pd.DataFrame, int]:
     student_row = result_df[result_df["student_id"].astype(str) == str(student_id)].copy()
@@ -261,7 +281,16 @@ if st.session_state["clustering_result"] is not None:
     metrics = clustering_result["metrics"]
     cluster_profiles = clustering_result["cluster_profiles"]
 
-    cluster_names_df = build_cluster_names(result_df, cluster_profiles)
+    cluster_names_df = build_cluster_names(
+        result_df=result_df,
+        cluster_profiles=cluster_profiles,
+    )
+
+    cluster_names_df = render_editable_cluster_names(
+        method_key="kmeans",
+        cluster_names_df=cluster_names_df,
+        title="Названия кластеров KMeans",
+    )
 
     st.subheader("Метрики кластеризации")
     m1, m2, m3 = st.columns(3)

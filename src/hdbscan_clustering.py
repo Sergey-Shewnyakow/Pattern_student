@@ -1,89 +1,119 @@
 import pandas as pd
-from sklearn.cluster import HDBSCAN
-from sklearn.preprocessing import StandardScaler
+
 from sklearn.metrics import (
     silhouette_score,
     calinski_harabasz_score,
     davies_bouldin_score,
 )
 
+from src.cluster_features import prepare_cluster_matrix
 
-def prepare_features_for_hdbscan(features_df: pd.DataFrame):
+
+def _calculate_hdbscan_metrics(x_scaled, labels):
     """
-    Подготавливает данные для HDBSCAN:
-    - оставляет только числовые признаки
-    - масштабирует данные
+    Считает метрики HDBSCAN.
+
+    Важно:
+    HDBSCAN может пометить часть объектов как шум: cluster = -1.
+    Метрики качества считаем только по объектам, которые попали в реальные кластеры.
     """
-    numeric_df = features_df.select_dtypes(include="number").copy()
+    labels_series = pd.Series(labels)
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(numeric_df)
+    non_noise_mask = labels_series != -1
+    non_noise_labels = labels_series[non_noise_mask]
 
-    return numeric_df, X_scaled, scaler
+    noise_count = int((labels_series == -1).sum())
+    clusters_count = int(len(set(labels)) - (1 if -1 in labels else 0))
 
-
-def _compute_metrics_without_noise(X_scaled, labels):
-    """
-    Считает метрики на точках без шума (-1), если кластеров достаточно.
-    """
-    valid_mask = labels != -1
-    X_valid = X_scaled[valid_mask]
-    labels_valid = labels[valid_mask]
-
-    unique_clusters = set(labels_valid)
-
-    if len(X_valid) < 2 or len(unique_clusters) < 2:
+    if non_noise_mask.sum() <= 1 or len(set(non_noise_labels)) <= 1:
         return {
             "silhouette_score": None,
             "calinski_harabasz_score": None,
             "davies_bouldin_score": None,
+            "clusters_count": clusters_count,
+            "noise_count": noise_count,
+            "noise_share": noise_count / len(labels) if len(labels) > 0 else 0,
         }
 
+    x_non_noise = x_scaled[non_noise_mask.values]
+
     return {
-        "silhouette_score": silhouette_score(X_valid, labels_valid),
-        "calinski_harabasz_score": calinski_harabasz_score(X_valid, labels_valid),
-        "davies_bouldin_score": davies_bouldin_score(X_valid, labels_valid),
+        "silhouette_score": silhouette_score(x_non_noise, non_noise_labels),
+        "calinski_harabasz_score": calinski_harabasz_score(
+            x_non_noise,
+            non_noise_labels,
+        ),
+        "davies_bouldin_score": davies_bouldin_score(
+            x_non_noise,
+            non_noise_labels,
+        ),
+        "clusters_count": clusters_count,
+        "noise_count": noise_count,
+        "noise_share": noise_count / len(labels) if len(labels) > 0 else 0,
     }
 
 
 def run_hdbscan(
     features_df: pd.DataFrame,
-    min_cluster_size: int = 5,
+    min_cluster_size: int = 10,
     min_samples: int | None = None,
-    cluster_selection_method: str = "eom",
-    metric: str = "euclidean"
 ):
     """
-    Запускает HDBSCAN на таблице признаков студентов.
-    """
-    numeric_df, X_scaled, scaler = prepare_features_for_hdbscan(features_df)
+    Запускает HDBSCAN.
 
-    model = HDBSCAN(
+    HDBSCAN использует тот же набор признаков, что KMeans, Agglomerative и GMM:
+    - типы учебной активности;
+    - общий уровень активности;
+    - регулярность поведения.
+
+    Особенность HDBSCAN:
+    - не нужно заранее задавать число кластеров;
+    - метод может выделять шумовые объекты: cluster = -1.
+    """
+    try:
+        import hdbscan
+    except ImportError as exc:
+        raise ImportError(
+            "Библиотека hdbscan не установлена. "
+            "Установите её командой: pip install hdbscan"
+        ) from exc
+
+    numeric_df, x_scaled, scaler = prepare_cluster_matrix(features_df)
+
+    model = hdbscan.HDBSCAN(
         min_cluster_size=min_cluster_size,
         min_samples=min_samples,
-        cluster_selection_method=cluster_selection_method,
-        metric=metric
+        prediction_data=True,
     )
 
-    labels = model.fit_predict(X_scaled)
+    labels = model.fit_predict(x_scaled)
 
     result_df = features_df.copy()
     result_df["cluster"] = labels
 
-    metrics = _compute_metrics_without_noise(X_scaled, labels)
+    if hasattr(model, "probabilities_"):
+        result_df["cluster_probability"] = model.probabilities_
+    else:
+        result_df["cluster_probability"] = 0.0
 
-    cluster_profiles = (
-        result_df[result_df["cluster"] != -1]
-        .groupby("cluster")
-        .mean(numeric_only=True)
-        .reset_index()
+    result_df["is_noise"] = result_df["cluster"] == -1
+
+    metrics = _calculate_hdbscan_metrics(
+        x_scaled=x_scaled,
+        labels=labels,
     )
 
-    noise_count = int((labels == -1).sum())
-    cluster_count = len(set(labels)) - (1 if -1 in labels else 0)
+    # Профили считаем только по реальным кластерам, без шума
+    clustered_df = result_df[result_df["cluster"] != -1].copy()
 
-    metrics["noise_count"] = noise_count
-    metrics["cluster_count"] = cluster_count
+    if clustered_df.empty:
+        cluster_profiles = pd.DataFrame()
+    else:
+        cluster_profiles = (
+            clustered_df.groupby("cluster")
+            .mean(numeric_only=True)
+            .reset_index()
+        )
 
     return {
         "result_df": result_df,
@@ -91,46 +121,50 @@ def run_hdbscan(
         "cluster_profiles": cluster_profiles,
         "model": model,
         "scaler": scaler,
+        "used_features": list(numeric_df.columns),
+        "min_cluster_size": min_cluster_size,
+        "min_samples": min_samples,
     }
 
 
-def evaluate_hdbscan_range(
+def evaluate_hdbscan_params(
     features_df: pd.DataFrame,
     min_cluster_size_values: list[int],
-    min_samples: int | None = None,
-    cluster_selection_method: str = "eom",
-    metric: str = "euclidean"
+    min_samples_values: list[int | None],
 ):
     """
-    Оценивает HDBSCAN для нескольких значений min_cluster_size.
-    """
-    numeric_df, X_scaled, _ = prepare_features_for_hdbscan(features_df)
+    Перебирает параметры HDBSCAN.
 
+    Основные параметры:
+    - min_cluster_size: минимальный размер кластера;
+    - min_samples: насколько строго метод считает точки шумом.
+
+    Чем больше min_cluster_size и min_samples, тем больше объектов может уйти в шум.
+    """
     rows = []
 
     for min_cluster_size in min_cluster_size_values:
-        model = HDBSCAN(
-            min_cluster_size=min_cluster_size,
-            min_samples=min_samples,
-            cluster_selection_method=cluster_selection_method,
-            metric=metric
-        )
+        for min_samples in min_samples_values:
+            result = run_hdbscan(
+                features_df=features_df,
+                min_cluster_size=min_cluster_size,
+                min_samples=min_samples,
+            )
 
-        labels = model.fit_predict(X_scaled)
-        cluster_count = len(set(labels)) - (1 if -1 in labels else 0)
-        noise_count = int((labels == -1).sum())
+            metrics = result["metrics"]
 
-        metric_values = _compute_metrics_without_noise(X_scaled, labels)
-
-        rows.append({
-            "min_cluster_size": min_cluster_size,
-            "cluster_count": cluster_count,
-            "noise_count": noise_count,
-            "silhouette_score": metric_values["silhouette_score"],
-            "calinski_harabasz_score": metric_values["calinski_harabasz_score"],
-            "davies_bouldin_score": metric_values["davies_bouldin_score"],
-            "metric": metric,
-            "cluster_selection_method": cluster_selection_method,
-        })
+            rows.append(
+                {
+                    "min_cluster_size": min_cluster_size,
+                    "min_samples": min_samples,
+                    "clusters_count": metrics["clusters_count"],
+                    "noise_count": metrics["noise_count"],
+                    "noise_share": metrics["noise_share"],
+                    "silhouette_score": metrics["silhouette_score"],
+                    "calinski_harabasz_score": metrics["calinski_harabasz_score"],
+                    "davies_bouldin_score": metrics["davies_bouldin_score"],
+                    "used_features": ", ".join(result["used_features"]),
+                }
+            )
 
     return pd.DataFrame(rows)
