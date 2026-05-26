@@ -479,9 +479,6 @@ if st.session_state.get("agglomerative_result") is not None:
         "—" if davies is None else f"{davies:.4f}",
     )
 
-    st.subheader("Использованные признаки")
-    st.write(used_features)
-
     st.subheader("Автоматические названия кластеров")
     st.dataframe(
         cluster_names_df,

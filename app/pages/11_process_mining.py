@@ -6,6 +6,7 @@ from src.state import init_session_state
 from src.ui_styles import apply_global_styles
 
 from src.process_mining_preprocessing import build_process_event_log
+
 from src.process_mining_analysis import (
     calculate_process_metrics,
     calculate_directly_follows,
@@ -14,17 +15,20 @@ from src.process_mining_analysis import (
     calculate_transition_matrix,
     compare_process_metrics_by_cluster,
 )
+
 from src.process_mining_visualization import (
     plot_process_map,
     plot_transition_heatmap,
     plot_top_transitions,
     plot_dotted_chart,
 )
+
 from src.pm4py_process_visualization import (
     build_pm4py_heuristic_svg,
     build_pm4py_process_tree_svg,
     save_svg_to_download_bytes,
 )
+
 from src.cluster_naming import build_cluster_names
 
 try:
@@ -33,10 +37,15 @@ except Exception:
     apply_custom_cluster_names = None
 
 from src.process_behavior_features import (
+    infer_required_course_elements,
     calculate_student_process_behavior_features,
     merge_resource_and_process_patterns,
 )
 
+
+# ============================================================
+# Настройка страницы
+# ============================================================
 
 st.set_page_config(
     page_title="Process Mining",
@@ -46,19 +55,15 @@ st.set_page_config(
 init_session_state()
 apply_global_styles()
 
-
 st.title("Process Mining")
 
-st.write(
-    "На этой странице анализируются последовательности действий студентов. "
-    "События Moodle нормализуются по component + context + activity, "
-    "чтобы диаграммы отражали понятные учебные действия."
-)
 
 
-# ------------------------------------------------------------
+
+# ============================================================
 # Получение исходного лога
-# ------------------------------------------------------------
+# ============================================================
+
 df_sessions = st.session_state.get("df_sessions")
 
 if df_sessions is None:
@@ -83,11 +88,11 @@ if "student_id" not in df_sessions.columns:
 df_sessions["student_id"] = df_sessions["student_id"].astype(str)
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Учитываем исключённых пользователей
-# ------------------------------------------------------------
-anomaly_df = st.session_state.get("anomaly_df")
+# ============================================================
 
+anomaly_df = st.session_state.get("anomaly_df")
 excluded_student_ids = []
 
 if anomaly_df is not None and not anomaly_df.empty:
@@ -145,10 +150,11 @@ if df_sessions.empty:
     st.stop()
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Вспомогательные функции для кластеров
-# ------------------------------------------------------------
-def get_result_from_session(possible_keys: list[str]):
+# ============================================================
+
+def get_result_from_session(possible_keys):
     for key in possible_keys:
         value = st.session_state.get(key)
 
@@ -164,8 +170,8 @@ METHOD_RESULTS = {
     "GMM": get_result_from_session(["gmm_result"]),
     "HDBSCAN": get_result_from_session(["hdbscan_result"]),
     "DEC": get_result_from_session(["dec_result", "deep_embedding_result"]),
+    "Autoencoder": get_result_from_session(["autoencoder_result", "autoencoder_clustering_result"]),
 }
-
 
 METHOD_KEY_MAP = {
     "KMeans": "kmeans",
@@ -173,74 +179,113 @@ METHOD_KEY_MAP = {
     "GMM": "gmm",
     "HDBSCAN": "hdbscan",
     "DEC": "dec",
+    "Autoencoder": "autoencoder",
 }
 
 
-def get_cluster_names_for_method(method_name: str, result: dict) -> pd.DataFrame:
+def get_cluster_names_for_method(method_name, result):
     if result is None:
+        return pd.DataFrame()
+
+    if not isinstance(result, dict):
         return pd.DataFrame()
 
     result_df = result.get("result_df")
     cluster_profiles = result.get("cluster_profiles")
 
-    if result_df is None or cluster_profiles is None:
+    if result_df is None or result_df.empty:
         return pd.DataFrame()
 
-    if result_df.empty:
+    if "cluster" not in result_df.columns:
         return pd.DataFrame()
+
+    if cluster_profiles is None or not isinstance(cluster_profiles, pd.DataFrame):
+        cluster_profiles = pd.DataFrame()
 
     if cluster_profiles.empty:
-        names_df = pd.DataFrame(
-            columns=["cluster", "cluster_size", "suggested_name", "description"]
+        names_df = (
+            result_df.groupby("cluster")
+            .agg(cluster_size=("student_id", "nunique"))
+            .reset_index()
+        )
+
+        names_df["suggested_name"] = names_df["cluster"].apply(
+            lambda x: "Шумовые / нетипичные студенты" if x == -1 else f"Кластер {x}"
+        )
+
+        names_df["description"] = names_df["cluster"].apply(
+            lambda x: (
+                "Студенты, не вошедшие в устойчивую группу."
+                if x == -1
+                else "Группа студентов со схожими признаками активности."
+            )
         )
     else:
-        if "cluster" in result_df.columns:
+        try:
             non_noise_result_df = result_df[result_df["cluster"] != -1].copy()
-        else:
-            non_noise_result_df = result_df.copy()
 
-        if non_noise_result_df.empty:
-            names_df = pd.DataFrame(
-                columns=["cluster", "cluster_size", "suggested_name", "description"]
-            )
-        else:
-            names_df = build_cluster_names(
-                result_df=non_noise_result_df,
-                cluster_profiles=cluster_profiles,
+            if non_noise_result_df.empty:
+                names_df = pd.DataFrame(
+                    columns=[
+                        "cluster",
+                        "cluster_size",
+                        "suggested_name",
+                        "description",
+                    ]
+                )
+            else:
+                names_df = build_cluster_names(
+                    result_df=non_noise_result_df,
+                    cluster_profiles=cluster_profiles,
+                )
+        except Exception:
+            names_df = (
+                result_df.groupby("cluster")
+                .agg(cluster_size=("student_id", "nunique"))
+                .reset_index()
             )
 
-    if "cluster" in result_df.columns:
+            names_df["suggested_name"] = names_df["cluster"].apply(
+                lambda x: f"Кластер {x}"
+            )
+
+            names_df["description"] = "Группа студентов со схожими признаками активности."
+
         noise_count = int((result_df["cluster"] == -1).sum())
-    else:
-        noise_count = 0
 
-    if noise_count > 0:
-        noise_row = pd.DataFrame(
-            [
-                {
-                    "cluster": -1,
-                    "cluster_size": noise_count,
-                    "suggested_name": "Шумовые / нетипичные студенты",
-                    "description": "Студенты, не вошедшие в устойчивую группу.",
-                }
-            ]
-        )
+        if noise_count > 0 and -1 not in names_df.get("cluster", pd.Series()).tolist():
+            noise_row = pd.DataFrame(
+                [
+                    {
+                        "cluster": -1,
+                        "cluster_size": noise_count,
+                        "suggested_name": "Шумовые / нетипичные студенты",
+                        "description": "Студенты, не вошедшие в устойчивую группу.",
+                    }
+                ]
+            )
 
-        names_df = pd.concat([noise_row, names_df], ignore_index=True)
+            names_df = pd.concat([noise_row, names_df], ignore_index=True)
 
     if apply_custom_cluster_names is not None:
-        method_key = METHOD_KEY_MAP.get(method_name, method_name.lower())
+        try:
+            method_key = METHOD_KEY_MAP.get(method_name, method_name.lower())
 
-        names_df = apply_custom_cluster_names(
-            method_key=method_key,
-            cluster_names_df=names_df,
-        )
+            names_df = apply_custom_cluster_names(
+                method_key=method_key,
+                cluster_names_df=names_df,
+            )
+        except Exception:
+            pass
 
     return names_df
 
 
-def build_clustered_students(method_name: str, result: dict) -> pd.DataFrame:
+def build_clustered_students(method_name, result):
     if result is None:
+        return pd.DataFrame()
+
+    if not isinstance(result, dict):
         return pd.DataFrame()
 
     result_df = result.get("result_df")
@@ -253,24 +298,33 @@ def build_clustered_students(method_name: str, result: dict) -> pd.DataFrame:
 
     names_df = get_cluster_names_for_method(method_name, result)
 
-    if names_df.empty:
-        return pd.DataFrame()
-
     students_df = result_df[["student_id", "cluster"]].copy()
     students_df["student_id"] = students_df["student_id"].astype(str)
 
-    students_df = students_df.merge(
-        names_df[["cluster", "suggested_name"]],
-        on="cluster",
-        how="left",
+    if not names_df.empty and "cluster" in names_df.columns:
+        if "suggested_name" not in names_df.columns:
+            names_df["suggested_name"] = names_df["cluster"].apply(
+                lambda x: f"Кластер {x}"
+            )
+
+        students_df = students_df.merge(
+            names_df[["cluster", "suggested_name"]],
+            on="cluster",
+            how="left",
+        )
+    else:
+        students_df["suggested_name"] = students_df["cluster"].apply(
+            lambda x: f"Кластер {x}"
+        )
+
+    students_df["suggested_name"] = students_df["suggested_name"].fillna(
+        students_df["cluster"].apply(lambda x: f"Кластер {x}")
     )
 
     return students_df
 
-def get_resource_patterns_for_method(method_name: str) -> pd.DataFrame:
-    """
-    Возвращает ресурсные паттерны студентов по выбранному методу кластеризации.
-    """
+
+def get_resource_patterns_for_method(method_name):
     method_result = METHOD_RESULTS.get(method_name)
 
     if method_result is None:
@@ -280,9 +334,69 @@ def get_resource_patterns_for_method(method_name: str) -> pd.DataFrame:
         method_name=method_name,
         result=method_result,
     )
-# ------------------------------------------------------------
+
+
+def prepare_required_editor_df(stats_df, element_type):
+    if stats_df is None or stats_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "use_as_required",
+                "element_type",
+                "context",
+                "students_completed",
+                "completion_share",
+            ]
+        )
+
+    editor_df = stats_df.copy()
+
+    if "context" not in editor_df.columns:
+        editor_df["context"] = ""
+
+    if "students_completed" not in editor_df.columns:
+        editor_df["students_completed"] = 0
+
+    if "completion_share" not in editor_df.columns:
+        editor_df["completion_share"] = 0.0
+
+    if "is_required" not in editor_df.columns:
+        editor_df["is_required"] = False
+
+    editor_df["use_as_required"] = editor_df["is_required"].astype(bool)
+    editor_df["element_type"] = element_type
+
+    editor_df["completion_share"] = pd.to_numeric(
+        editor_df["completion_share"],
+        errors="coerce",
+    ).fillna(0.0)
+
+    editor_df["students_completed"] = pd.to_numeric(
+        editor_df["students_completed"],
+        errors="coerce",
+    ).fillna(0).astype(int)
+
+    editor_df = editor_df[
+        [
+            "use_as_required",
+            "element_type",
+            "context",
+            "students_completed",
+            "completion_share",
+        ]
+    ].copy()
+
+    editor_df = editor_df.sort_values(
+        ["use_as_required", "students_completed", "completion_share"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
+
+    return editor_df
+
+
+# ============================================================
 # Настройки подготовки event log
-# ------------------------------------------------------------
+# ============================================================
+
 st.subheader("Настройки подготовки event log")
 
 col_1, col_2, col_3 = st.columns(3)
@@ -319,9 +433,10 @@ st.caption(
 )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Построение event log
-# ------------------------------------------------------------
+# ============================================================
+
 process_settings = {
     "detail_level": detail_level,
     "collapse_duplicates": collapse_duplicates,
@@ -347,19 +462,22 @@ if need_rebuild_event_log:
         st.session_state["process_event_log"] = process_event_log
         st.session_state["process_settings"] = process_settings
 
-        # Сбрасываем SVG, потому что event log мог измениться
-        for svg_key in [
+        for key in [
             "pm4py_heuristic_svg",
             "pm4py_process_tree_svg",
             "pm4py_svg_scope_name",
+            "required_elements_result",
+            "manual_required_assignments_df",
+            "manual_required_tests_df",
+            "selected_required_assignments",
+            "selected_required_tests",
         ]:
-            if svg_key in st.session_state:
-                del st.session_state[svg_key]
+            if key in st.session_state:
+                del st.session_state[key]
 
     except Exception as e:
         st.exception(e)
         st.stop()
-
 
 process_event_log = st.session_state.get("process_event_log")
 
@@ -371,18 +489,23 @@ process_event_log = process_event_log.copy()
 process_event_log["student_id"] = process_event_log["student_id"].astype(str)
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Краткая информация по подготовке
-# ------------------------------------------------------------
+# ============================================================
+
 st.subheader("Итог подготовки данных для process mining")
 
 prep_1, prep_2, prep_3, prep_4 = st.columns(4)
 
 prep_1.metric("Пользователей в event log", process_event_log["student_id"].nunique())
 prep_2.metric("Событий в event log", len(process_event_log))
-prep_3.metric("Типов действий", process_event_log["process_activity"].nunique())
-prep_4.metric("Исключено не-студентов", len(excluded_student_ids))
 
+if "process_activity" in process_event_log.columns:
+    prep_3.metric("Типов действий", process_event_log["process_activity"].nunique())
+else:
+    prep_3.metric("Типов действий", "—")
+
+prep_4.metric("Исключено не-студентов", len(excluded_student_ids))
 
 with st.expander("Показать подготовленный event log"):
     display_columns = [
@@ -395,7 +518,8 @@ with st.expander("Показать подготовленный event log"):
     ]
 
     available_display_columns = [
-        col for col in display_columns if col in process_event_log.columns
+        col for col in display_columns
+        if col in process_event_log.columns
     ]
 
     st.dataframe(
@@ -417,9 +541,11 @@ with st.expander("Показать подготовленный event log"):
         key="download_full_process_event_log_csv",
     )
 
-# ------------------------------------------------------------
+
+# ============================================================
 # Уникальные контексты событий
-# ------------------------------------------------------------
+# ============================================================
+
 st.subheader("Уникальные контексты событий")
 
 context_columns = [
@@ -454,13 +580,16 @@ if context_columns:
 else:
     st.info("В event log нет колонок component, context, activity или process_activity.")
 
-# ------------------------------------------------------------
-# Фильтр области анализа
-# ------------------------------------------------------------
+
+# ============================================================
+# Область анализа
+# ============================================================
+
 st.subheader("Область анализа")
 
 available_methods = [
-    method_name for method_name, result in METHOD_RESULTS.items()
+    method_name
+    for method_name, result in METHOD_RESULTS.items()
     if result is not None
 ]
 
@@ -589,9 +718,10 @@ if filtered_event_log.empty:
     st.stop()
 
 
-# ------------------------------------------------------------
-# Если область анализа изменилась, сбрасываем старые SVG
-# ------------------------------------------------------------
+# ============================================================
+# Сброс старых SVG при смене области
+# ============================================================
+
 previous_svg_scope_name = st.session_state.get("pm4py_svg_scope_name")
 
 if previous_svg_scope_name != selected_scope_name:
@@ -605,9 +735,10 @@ if previous_svg_scope_name != selected_scope_name:
     st.session_state["pm4py_svg_scope_name"] = selected_scope_name
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Метрики процесса
-# ------------------------------------------------------------
+# ============================================================
+
 st.subheader("Метрики процесса")
 
 metrics = calculate_process_metrics(filtered_event_log)
@@ -636,9 +767,10 @@ with st.expander("Показать все метрики process mining"):
     )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Частоты действий и переходов
-# ------------------------------------------------------------
+# ============================================================
+
 activity_freq_df = calculate_activity_frequencies(filtered_event_log)
 transitions_df = calculate_directly_follows(filtered_event_log)
 
@@ -661,9 +793,10 @@ with col_freq_2:
     )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Настройки диаграмм
-# ------------------------------------------------------------
+# ============================================================
+
 st.subheader("Настройки диаграмм")
 
 v1, v2, v3 = st.columns(3)
@@ -699,9 +832,10 @@ with v3:
     )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Обычная process map
-# ------------------------------------------------------------
+# ============================================================
+
 st.subheader("Обычная process map / Directly-Follows Graph")
 
 fig_process_map = plot_process_map(
@@ -721,15 +855,18 @@ st.caption(
 )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # PM4Py SVG-диаграммы
-# ------------------------------------------------------------
+# ============================================================
+
 st.subheader("PM4Py-диаграммы процесса в SVG")
 
 st.write(
-    "Эти диаграммы строятся через PM4Py по нажатию на кнопку. "
-    "Они строятся для текущей выбранной области анализа: весь курс, выбранный кластер "
-    "или выбранный студент."
+    """
+    Эти диаграммы строятся через PM4Py по нажатию на кнопку.
+    Они строятся для текущей выбранной области анализа:
+    весь курс, выбранный кластер или выбранный студент.
+    """
 )
 
 pm4py_tab_1, pm4py_tab_2 = st.tabs(
@@ -792,8 +929,8 @@ with pm4py_tab_1:
                     min_dfg_occurrences=pm4py_min_dfg_occurrences,
                 )
 
-                st.session_state["pm4py_heuristic_svg"] = heuristic_svg
-                st.session_state["pm4py_svg_scope_name"] = selected_scope_name
+            st.session_state["pm4py_heuristic_svg"] = heuristic_svg
+            st.session_state["pm4py_svg_scope_name"] = selected_scope_name
 
         except Exception as e:
             st.exception(e)
@@ -843,8 +980,8 @@ with pm4py_tab_2:
                     noise_threshold=pm4py_noise_threshold,
                 )
 
-                st.session_state["pm4py_process_tree_svg"] = process_tree_svg
-                st.session_state["pm4py_svg_scope_name"] = selected_scope_name
+            st.session_state["pm4py_process_tree_svg"] = process_tree_svg
+            st.session_state["pm4py_svg_scope_name"] = selected_scope_name
 
         except Exception as e:
             st.exception(e)
@@ -867,9 +1004,10 @@ with pm4py_tab_2:
         )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Top transitions
-# ------------------------------------------------------------
+# ============================================================
+
 st.subheader("Top переходов")
 
 fig_top_transitions = plot_top_transitions(
@@ -883,9 +1021,10 @@ st.plotly_chart(
 )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Heatmap переходов
-# ------------------------------------------------------------
+# ============================================================
+
 st.subheader("Heatmap переходов")
 
 transition_matrix_df = calculate_transition_matrix(transitions_df)
@@ -901,9 +1040,10 @@ st.plotly_chart(
 )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Dotted chart
-# ------------------------------------------------------------
+# ============================================================
+
 st.subheader("Dotted chart активности во времени")
 
 d1, d2 = st.columns(2)
@@ -920,7 +1060,7 @@ with d2:
     max_students_timeline = st.slider(
         "Максимум студентов, если выбраны все",
         min_value=10,
-        max_value=300,
+        max_value= 400,
         value=100,
         step=10,
         key="process_max_students_dotted",
@@ -961,9 +1101,10 @@ st.caption(
 )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Варианты траекторий
-# ------------------------------------------------------------
+# ============================================================
+
 st.subheader("Наиболее частые варианты траекторий")
 
 variants_df = calculate_variants(
@@ -982,9 +1123,10 @@ st.caption(
 )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Сравнение process mining метрик по кластерам
-# ------------------------------------------------------------
+# ============================================================
+
 st.subheader("Сравнение process mining метрик по кластерам")
 
 if not available_methods:
@@ -1040,19 +1182,24 @@ else:
             )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Процессные паттерны студентов
-# ------------------------------------------------------------
+# ============================================================
+
 st.subheader("Выявление процессных паттернов студентов")
 
 st.write(
-    "Этот блок уточняет результаты кластеризации. Кластеризация показывает, "
-    "какие ресурсы студент использовал, а process mining показывает, как именно "
-    "он проходил курс: регулярно, аврально, формально, с быстрым прохождением "
-    "лекций или с неполным выполнением контрольных активностей."
+    """
+    Этот блок уточняет результаты кластеризации.
+    Кластеризация показывает, какие ресурсы студент использовал,
+    а process mining показывает, как именно он проходил курс:
+    регулярно, аврально, формально, с быстрым прохождением лекций
+    или с неполным выполнением контрольных активностей.
+    """
 )
 
 pb1, pb2, pb3, pb4, pb5 = st.columns(5)
+
 with pb1:
     last_period_days = st.slider(
         "Последний период курса, дней",
@@ -1095,7 +1242,7 @@ with pb4:
 
 with pb5:
     min_required_completion_share = st.slider(
-        "Порог обязательного элемента",
+        "Порог автоматического определения обязательного элемента",
         min_value=0.10,
         max_value=0.95,
         value=0.50,
@@ -1112,13 +1259,280 @@ if available_methods:
 else:
     selected_resource_method = None
     st.info(
-        "Методы кластеризации ещё не запускались. Будут рассчитаны только процессные паттерны."
+        "Методы кластеризации ещё не запускались. "
+        "Будут рассчитаны только процессные паттерны."
     )
 
-if st.button(
+
+# ============================================================
+# 1. Автоматическое определение обязательных элементов
+# ============================================================
+
+st.subheader("1. Автоматическое определение обязательных элементов курса")
+
+st.write(
+    """
+    Сначала система автоматически находит элементы, которые похожи на обязательные.
+    После этого список можно вручную исправить: включить нужные элементы
+    и исключить необязательные, тренировочные или технические элементы.
+    """
+)
+
+required_detection_settings = {
+    "min_required_completion_share": float(min_required_completion_share),
+    "process_event_log_rows": int(len(process_event_log)),
+    "process_event_log_students": int(process_event_log["student_id"].nunique()),
+}
+
+previous_required_detection_settings = st.session_state.get(
+    "required_detection_settings"
+)
+
+need_recalculate_required_elements = (
+    st.session_state.get("required_elements_result") is None
+    or previous_required_detection_settings != required_detection_settings
+)
+
+detect_required_button = st.button(
+    "Определить обязательные элементы курса",
+    key="detect_required_course_elements_button",
+)
+
+if detect_required_button or need_recalculate_required_elements:
+    try:
+        required_elements_result = infer_required_course_elements(
+            event_log=process_event_log,
+            min_required_completion_share=min_required_completion_share,
+        )
+
+        st.session_state["required_elements_result"] = required_elements_result
+        st.session_state["required_detection_settings"] = required_detection_settings
+
+        for key in [
+            "manual_required_assignments_df",
+            "manual_required_tests_df",
+            "selected_required_assignments",
+            "selected_required_tests",
+        ]:
+            if key in st.session_state:
+                del st.session_state[key]
+
+    except Exception as e:
+        st.exception(e)
+        st.stop()
+
+required_elements_result = st.session_state.get("required_elements_result")
+
+if required_elements_result is None:
+    st.warning("Сначала определите обязательные элементы курса.")
+    st.stop()
+
+assignment_stats_df = required_elements_result.get(
+    "assignment_completion_stats",
+    pd.DataFrame(),
+)
+
+test_stats_df = required_elements_result.get(
+    "test_completion_stats",
+    pd.DataFrame(),
+)
+
+default_assignment_editor_df = prepare_required_editor_df(
+    assignment_stats_df,
+    element_type="Задание",
+)
+
+default_test_editor_df = prepare_required_editor_df(
+    test_stats_df,
+    element_type="Тест",
+)
+
+if "manual_required_assignments_df" not in st.session_state:
+    st.session_state["manual_required_assignments_df"] = default_assignment_editor_df
+
+if "manual_required_tests_df" not in st.session_state:
+    st.session_state["manual_required_tests_df"] = default_test_editor_df
+
+
+# ============================================================
+# 2. Ручная проверка обязательных элементов
+# ============================================================
+
+st.subheader("2. Ручная проверка обязательных элементов")
+
+st.info(
+    """
+    Отметьте галочками только те элементы, которые действительно должны учитываться
+    как обязательные. Например, если тест был тренировочным или техническим,
+    его можно исключить из расчёта.
+    """
+)
+
+required_tab_1, required_tab_2 = st.tabs(
+    [
+        "Обязательные задания",
+        "Обязательные тесты",
+    ]
+)
+
+with required_tab_1:
+    st.write("### Выбор обязательных заданий")
+
+    if st.session_state["manual_required_assignments_df"].empty:
+        st.warning("Кандидаты в обязательные задания не найдены.")
+        edited_assignments_df = pd.DataFrame()
+    else:
+        edited_assignments_df = st.data_editor(
+            st.session_state["manual_required_assignments_df"],
+            use_container_width=True,
+            hide_index=True,
+            key="manual_required_assignments_editor",
+            disabled=[
+                "element_type",
+                "context",
+                "students_completed",
+                "completion_share",
+            ],
+            column_config={
+                "use_as_required": st.column_config.CheckboxColumn(
+                    "Учитывать как обязательное",
+                    help="Если включено, элемент будет считаться обязательным при расчёте процессных паттернов.",
+                    default=False,
+                ),
+                "element_type": st.column_config.TextColumn(
+                    "Тип",
+                ),
+                "context": st.column_config.TextColumn(
+                    "Элемент курса",
+                ),
+                "students_completed": st.column_config.NumberColumn(
+                    "Студентов выполнили",
+                ),
+                "completion_share": st.column_config.ProgressColumn(
+                    "Доля выполнения",
+                    min_value=0.0,
+                    max_value=1.0,
+                    format="%.2f",
+                ),
+            },
+        )
+
+with required_tab_2:
+    st.write("### Выбор обязательных тестов")
+
+    if st.session_state["manual_required_tests_df"].empty:
+        st.warning("Кандидаты в обязательные тесты не найдены.")
+        edited_tests_df = pd.DataFrame()
+    else:
+        edited_tests_df = st.data_editor(
+            st.session_state["manual_required_tests_df"],
+            use_container_width=True,
+            hide_index=True,
+            key="manual_required_tests_editor",
+            disabled=[
+                "element_type",
+                "context",
+                "students_completed",
+                "completion_share",
+            ],
+            column_config={
+                "use_as_required": st.column_config.CheckboxColumn(
+                    "Учитывать как обязательное",
+                    help="Если включено, элемент будет считаться обязательным при расчёте процессных паттернов.",
+                    default=False,
+                ),
+                "element_type": st.column_config.TextColumn(
+                    "Тип",
+                ),
+                "context": st.column_config.TextColumn(
+                    "Элемент курса",
+                ),
+                "students_completed": st.column_config.NumberColumn(
+                    "Студентов начали / выполнили",
+                ),
+                "completion_share": st.column_config.ProgressColumn(
+                    "Доля выполнения",
+                    min_value=0.0,
+                    max_value=1.0,
+                    format="%.2f",
+                ),
+            },
+        )
+
+if not edited_assignments_df.empty and "use_as_required" in edited_assignments_df.columns:
+    selected_required_assignments = (
+        edited_assignments_df.loc[
+            edited_assignments_df["use_as_required"] == True,
+            "context",
+        ]
+        .dropna()
+        .astype(str)
+        .tolist()
+    )
+else:
+    selected_required_assignments = []
+
+if not edited_tests_df.empty and "use_as_required" in edited_tests_df.columns:
+    selected_required_tests = (
+        edited_tests_df.loc[
+            edited_tests_df["use_as_required"] == True,
+            "context",
+        ]
+        .dropna()
+        .astype(str)
+        .tolist()
+    )
+else:
+    selected_required_tests = []
+
+st.session_state["selected_required_assignments"] = selected_required_assignments
+st.session_state["selected_required_tests"] = selected_required_tests
+
+summary_col_1, summary_col_2, summary_col_3 = st.columns(3)
+
+summary_col_1.metric(
+    "Выбрано обязательных заданий",
+    len(selected_required_assignments),
+)
+
+summary_col_2.metric(
+    "Выбрано обязательных тестов",
+    len(selected_required_tests),
+)
+
+summary_col_3.metric(
+    "Всего обязательных элементов",
+    len(selected_required_assignments) + len(selected_required_tests),
+)
+
+with st.expander("Показать выбранные обязательные элементы"):
+    st.write("**Выбранные обязательные задания:**")
+    st.write(selected_required_assignments if selected_required_assignments else "Не выбрано")
+
+    st.write("**Выбранные обязательные тесты:**")
+    st.write(selected_required_tests if selected_required_tests else "Не выбрано")
+
+
+# ============================================================
+# 3. Расчёт процессных паттернов
+# ============================================================
+
+st.subheader("3. Расчёт процессных паттернов по выбранным обязательным элементам")
+
+st.warning(
+    """
+    Если не выбрать ни одного обязательного задания или теста,
+    показатели полноты выполнения контрольных активностей будут рассчитаны
+    относительно 0 обязательных элементов. Перед расчётом проверьте список выше.
+    """
+)
+
+calculate_button = st.button(
     "Рассчитать процессные паттерны студентов",
     key="calculate_process_behavior_patterns_button",
-):
+)
+
+if calculate_button:
     try:
         process_behavior_features_df = calculate_student_process_behavior_features(
             event_log=process_event_log,
@@ -1127,6 +1541,8 @@ if st.button(
             fast_test_minutes=fast_test_minutes,
             fast_lecture_minutes=fast_lecture_minutes,
             min_required_completion_share=min_required_completion_share,
+            required_assignments=selected_required_assignments,
+            required_tests=selected_required_tests,
         )
 
         if selected_resource_method is not None:
@@ -1143,38 +1559,33 @@ if st.button(
 
         st.session_state["process_behavior_features_df"] = process_behavior_features_df
         st.session_state["final_behavior_df"] = final_behavior_df
+        st.session_state["manual_required_assignments_used"] = selected_required_assignments
+        st.session_state["manual_required_tests_used"] = selected_required_tests
 
-
-        st.subheader("Автоматически найденные обязательные элементы курса")
-
-        required_assignments_list = (
-            final_behavior_df["required_assignments_list"].dropna().iloc[0]
-            if "required_assignments_list" in final_behavior_df.columns
-               and not final_behavior_df.empty
-            else ""
-        )
-
-        required_tests_list = (
-            final_behavior_df["required_tests_list"].dropna().iloc[0]
-            if "required_tests_list" in final_behavior_df.columns
-               and not final_behavior_df.empty
-            else ""
-        )
-
-        st.write("**Обязательные задания:**")
-        st.write(required_assignments_list if required_assignments_list else "Не найдены")
-
-        st.write("**Обязательные тесты:**")
-        st.write(required_tests_list if required_tests_list else "Не найдены")
-
+        st.success("Процессные паттерны рассчитаны по выбранным обязательным элементам.")
 
     except Exception as e:
         st.exception(e)
 
+
+# ============================================================
+# 4. Отображение результатов
+# ============================================================
+
 if st.session_state.get("final_behavior_df") is not None:
-    final_behavior_df = st.session_state["final_behavior_df"]
+    final_behavior_df = st.session_state["final_behavior_df"].copy()
 
     st.subheader("Итоговые ресурсно-процессные паттерны")
+
+    used_assignments = st.session_state.get("manual_required_assignments_used", [])
+    used_tests = st.session_state.get("manual_required_tests_used", [])
+
+    with st.expander("Обязательные элементы, использованные в последнем расчёте"):
+        st.write("**Задания:**")
+        st.write(used_assignments if used_assignments else "Не выбраны")
+
+        st.write("**Тесты:**")
+        st.write(used_tests if used_tests else "Не выбраны")
 
     important_columns = [
         "student_id",
@@ -1182,46 +1593,52 @@ if st.session_state.get("final_behavior_df") is not None:
         "resource_pattern",
         "process_pattern",
         "final_behavior_pattern",
-
         "completed_assignments_count",
         "expected_assignments_count",
         "assignment_completion_ratio",
-
+        "completed_assignments_list",
+        "missing_assignments_list",
         "completed_tests_count",
         "expected_tests_count",
         "test_completion_ratio",
+        "completed_tests_list",
+        "missing_tests_list",
         "control_completion_ratio",
-
         "process_total_events",
         "process_active_days",
         "max_day_activity_ratio",
         "top_2_days_activity_ratio",
         "top_3_days_activity_ratio",
         "days_to_80_percent_events",
-
+        "last_period_events_ratio",
         "fast_lecture_completion_count",
         "measured_lecture_completion_count",
         "fast_lecture_completion_ratio",
         "median_lecture_duration_min",
-
         "fast_test_completion_count",
         "measured_test_completion_count",
         "fast_test_completion_ratio",
         "median_test_duration_min",
-
         "fast_assignment_upload_count",
         "measured_assignment_upload_count",
         "fast_assignment_upload_ratio",
         "median_assignment_upload_delay_min",
-
-        "final_behavior_description",
-
-        "process_flags",
-        "process_flags_count",
         "suspicious_first_assignment_upload_count",
         "measured_first_assignment_upload_count",
         "suspicious_first_assignment_upload_ratio",
         "median_first_assignment_upload_delay_min",
+        "trace_length",
+        "linearity",
+        "complexity",
+        "returns_count",
+        "variant_frequency",
+        "final_behavior_description",
+        "process_flags",
+        "process_flags_count",
+        "required_assignments_count",
+        "required_tests_count",
+        "required_assignments_list",
+        "required_tests_list",
     ]
 
     available_columns = [
@@ -1251,45 +1668,51 @@ if st.session_state.get("final_behavior_df") is not None:
     # ------------------------------------------------------------
     # Распределение процессных паттернов
     # ------------------------------------------------------------
+
     st.subheader("Распределение процессных паттернов")
 
-    process_pattern_counts = (
-        final_behavior_df["process_pattern"]
-        .value_counts()
-        .reset_index()
-    )
+    if "process_pattern" in final_behavior_df.columns:
+        process_pattern_counts = (
+            final_behavior_df["process_pattern"]
+            .value_counts()
+            .reset_index()
+        )
 
-    process_pattern_counts.columns = [
-        "process_pattern",
-        "students_count",
-    ]
+        process_pattern_counts.columns = [
+            "process_pattern",
+            "students_count",
+        ]
 
-    st.bar_chart(
-        process_pattern_counts.set_index("process_pattern")
-    )
+        st.bar_chart(
+            process_pattern_counts.set_index("process_pattern")
+        )
 
-    st.dataframe(
-        process_pattern_counts,
-        use_container_width=True,
-    )
+        st.dataframe(
+            process_pattern_counts,
+            use_container_width=True,
+        )
 
     # ------------------------------------------------------------
-    # Студенты, у которых ресурсный паттерн требует уточнения
+    # Студенты с рискованными процессными признаками
     # ------------------------------------------------------------
+
     st.subheader("Студенты, у которых ресурсный паттерн требует уточнения")
 
     suspicious_patterns = [
         "Неполное выполнение контрольных активностей",
-        "Авральное прохождение курса",
+        "Сжатое прохождение курса",
         "Формально комплексное прохождение",
         "Формальное прохождение лекционных элементов",
         "Быстрое прохождение тестов",
-        "Быстрая загрузка ответов после открытия заданий",
+        "Подозрительно быстрая первая загрузка ответов",
     ]
 
-    suspicious_df = final_behavior_df[
-        final_behavior_df["process_pattern"].isin(suspicious_patterns)
-    ].copy()
+    if "process_pattern" in final_behavior_df.columns:
+        suspicious_df = final_behavior_df[
+            final_behavior_df["process_pattern"].isin(suspicious_patterns)
+        ].copy()
+    else:
+        suspicious_df = pd.DataFrame()
 
     if suspicious_df.empty:
         st.success(
@@ -1309,10 +1732,11 @@ if st.session_state.get("final_behavior_df") is not None:
     # ------------------------------------------------------------
     # Анализ одного студента
     # ------------------------------------------------------------
+
     st.subheader("Подробная интерпретация выбранного студента")
 
     behavior_student_ids = sorted(
-        final_behavior_df["student_id"].astype(str).tolist()
+        final_behavior_df["student_id"].astype(str).unique().tolist()
     )
 
     selected_behavior_student = st.selectbox(
@@ -1322,8 +1746,7 @@ if st.session_state.get("final_behavior_df") is not None:
     )
 
     selected_behavior_row = final_behavior_df[
-        final_behavior_df["student_id"].astype(str)
-        == str(selected_behavior_student)
+        final_behavior_df["student_id"].astype(str) == str(selected_behavior_student)
     ].copy()
 
     if not selected_behavior_row.empty:
@@ -1331,10 +1754,10 @@ if st.session_state.get("final_behavior_df") is not None:
 
         st.info(
             f"Студент **{selected_behavior_student}**: "
-            f"**{row['final_behavior_pattern']}**"
+            f"**{row.get('final_behavior_pattern', row.get('process_pattern', 'Нет данных'))}**"
         )
 
-        st.write(row["final_behavior_description"])
+        st.write(row.get("final_behavior_description", ""))
 
         st.dataframe(
             selected_behavior_row[available_columns],
@@ -1342,10 +1765,10 @@ if st.session_state.get("final_behavior_df") is not None:
         )
 
 
-
-# ------------------------------------------------------------
+# ============================================================
 # К каким кластерам относится выбранный студент
-# ------------------------------------------------------------
+# ============================================================
+
 st.subheader("Кластеры выбранного студента")
 
 all_student_ids_for_cluster_info = sorted(
@@ -1385,7 +1808,10 @@ for method_name, method_result in METHOD_RESULTS.items():
 
     probability_value = None
 
-    result_df = method_result.get("result_df")
+    if isinstance(method_result, dict):
+        result_df = method_result.get("result_df")
+    else:
+        result_df = None
 
     if (
         result_df is not None
@@ -1433,33 +1859,8 @@ if student_cluster_rows:
     else:
         st.warning(
             f"У студента {selected_student_for_cluster_info} разные методы дали "
-            f"разные паттерны: {', '.join(unique_patterns)}. "
-            f"Это может указывать на смешанное или пограничное поведение."
+            f"разные паттерны: {', '.join(unique_patterns)}."
         )
 else:
-    st.info(
-        "Для выбранного студента нет данных о кластерах. "
-        "Сначала запустите методы кластеризации."
-    )
-
-
-# ------------------------------------------------------------
-# Краткая интерпретация
-# ------------------------------------------------------------
-st.subheader("Краткая интерпретация")
-
-st.write(
-    f"""
-Анализируемая область: **{selected_scope_name}**.
-
-Для анализа использовано {metrics["case_count"]} пользователей и 
-{metrics["events_count"]} событий. Количество уникальных вариантов траекторий: 
-{metrics["variants_count"]}. Средняя длина траектории составляет 
-{metrics["avg_trace_length"]:.2f} действий, средняя линейность — 
-{metrics["avg_linearity"]:.3f}. Низкая линейность и высокое число вариантов 
-указывают на то, что студенты проходят курс не по единому маршруту, а используют 
-разные последовательности действий. Process mining дополняет кластеризацию: 
-кластеризация показывает тип поведения студента по признакам, а process mining 
-раскрывает порядок действий внутри этого поведения.
-"""
-)
+    st.info("Для выбранного студента нет данных по кластерам.")
+    st.info("Для выбранного студента нет данных по кластерам.")

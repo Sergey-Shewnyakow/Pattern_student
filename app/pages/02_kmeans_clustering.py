@@ -343,6 +343,39 @@ if st.session_state["clustering_result"] is not None:
     with st.expander("Показать PCA-таблицу"):
         st.dataframe(pca_df, use_container_width=True)
 
+    st.subheader("PCA-визуализация для отчёта")
+
+    if st.checkbox(
+            "Показать крупный PCA-график для вставки в отчёт",
+            value=False,
+            key="show_report_pca_kmeans",
+    ):
+        fig_report_pca, report_pca_df = plot_pca_clusters_for_report(
+            features_scaled=features_scaled,
+            result_df=result_df,
+            cluster_names_df=cluster_names_df,
+            title="PCA-визуализация кластеров K-Means",
+        )
+
+        st.plotly_chart(
+            fig_report_pca,
+            use_container_width=True,
+        )
+
+        st.download_button(
+            "Скачать PCA-график HTML",
+            data=fig_report_pca.to_html().encode("utf-8"),
+            file_name="pca_clusters_kmeans_report.html",
+            mime="text/html",
+            key="download_pca_kmeans_html",
+        )
+
+        st.dataframe(
+            report_pca_df,
+            use_container_width=True,
+        )
+
+
     st.subheader("График среднего признака по кластерам")
     available_features = [
         col for col in cluster_profiles.columns

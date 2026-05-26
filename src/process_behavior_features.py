@@ -1,163 +1,64 @@
 import pandas as pd
 import numpy as np
+from typing import Optional, List, Dict, Any
 
 
-MATERIAL_ACTIONS = [
-    "Открытие лекции",
-    "Начало лекции",
-    "Продолжение лекции",
-    "Завершение лекции",
-    "Повтор лекции",
-    "Изучение лекции",
-    "Просмотр видеолекции",
-    "Просмотр страницы курса",
-    "Открытие страницы курса",
-]
-
-
-CONTROL_ACTIONS = [
-    "Открытие теста",
-    "Начало теста",
-    "Работа с тестом",
-    "Завершение теста",
-    "Просмотр попытки теста",
-    "Просмотр результата теста",
-    "Просмотр сводки теста",
-    "Открытие практического задания",
-    "Открытие формы ответа",
-    "Загрузка файла",
-    "Отправка практического задания",
-    "Просмотр статуса задания",
-]
-
-
-ASSIGNMENT_OPEN_ACTIONS = [
-    "Открытие практического задания",
-    "Открытие формы ответа",
-    "Просмотр статуса задания",
-]
-
-
-ASSIGNMENT_SUBMIT_ACTIONS = [
-    "Загрузка файла",
-    "Отправка практического задания",
-    "Обновление ответа",
-]
-
-
-LECTURE_START_ACTIONS = [
-    "Начало лекции",
-    "Повтор лекции",
-]
-
-
-LECTURE_END_ACTIONS = [
-    "Завершение лекции",
-]
-
-
-TEST_START_ACTIONS = [
-    "Начало теста",
-]
-
-
-TEST_COMPLETION_OR_PARTICIPATION_ACTIONS = [
-    "Начало теста",
-    "Завершение теста",
-    "Просмотр результата теста",
-    "Просмотр сводки теста",
-    "Просмотр попытки теста",
-]
-
-
-TEST_FINISH_ACTIONS = [
-    "Завершение теста",
-]
-
-
-def _safe_datetime(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, errors="coerce")
-
-
-def _safe_text(value) -> str:
-    if value is None or pd.isna(value):
-        return ""
-    return str(value)
-
+# ============================================================
+# Нормализация и служебные функции
+# ============================================================
 
 def _normalize_context(value) -> str:
-    text = _safe_text(value).strip()
+    """
+    Приводит название элемента курса к единому виду.
+    Это важно, чтобы ручной выбор обязательных элементов совпадал
+    с названиями внутри event log.
+    """
+    if value is None:
+        return ""
+
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+
+    text = str(value).strip()
     text = " ".join(text.split())
     return text
 
 
-def _calculate_top_days_ratio(group: pd.DataFrame, top_n_days: int) -> float:
-    if group.empty:
+def _safe_ratio(numerator, denominator) -> float:
+    if denominator is None or denominator == 0:
+        return 0.0
+    try:
+        return float(numerator) / float(denominator)
+    except Exception:
         return 0.0
 
-    total_events = len(group)
 
-    if total_events == 0:
-        return 0.0
-
-    events_by_day = (
-        group.groupby(group["timestamp"].dt.date)
-        .size()
-        .sort_values(ascending=False)
-    )
-
-    top_events = events_by_day.head(top_n_days).sum()
-
-    return float(top_events / total_events)
+def _contains_any(text: str, keywords: List[str]) -> bool:
+    text = str(text).lower()
+    return any(keyword.lower() in text for keyword in keywords)
 
 
-def _calculate_days_to_percent_events(
-    group: pd.DataFrame,
-    percent: float = 0.8,
-) -> int:
-    if group.empty:
-        return 0
-
-    total_events = len(group)
-
-    if total_events == 0:
-        return 0
-
-    events_by_day = (
-        group.groupby(group["timestamp"].dt.date)
-        .size()
-        .sort_values(ascending=False)
-    )
-
-    cumulative_events = 0
-
-    for day_index, events_count in enumerate(events_by_day, start=1):
-        cumulative_events += int(events_count)
-
-        if cumulative_events / total_events >= percent:
-            return day_index
-
-    return len(events_by_day)
-
-
-def infer_required_course_elements(
-    event_log: pd.DataFrame,
-    min_required_completion_share: float = 0.5,
-) -> dict:
+def _prepare_event_log(event_log: pd.DataFrame) -> pd.DataFrame:
     """
-    Универсально определяет обязательные задания и тесты курса.
-
-    Элемент считается обязательным, если его выполнила/начала значительная часть студентов.
+    Подготавливает event log к расчёту процессных признаков.
     """
     if event_log is None or event_log.empty:
-        return {
-            "required_assignments": [],
-            "required_tests": [],
-            "assignment_completion_stats": pd.DataFrame(),
-            "test_completion_stats": pd.DataFrame(),
-        }
+        return pd.DataFrame()
 
     df = event_log.copy()
+
+    if "student_id" not in df.columns:
+        raise ValueError("В event log отсутствует колонка student_id.")
+
+    if "timestamp" not in df.columns:
+        raise ValueError("В event log отсутствует колонка timestamp.")
+
+    df["student_id"] = df["student_id"].astype(str)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df = df[df["timestamp"].notna()].copy()
 
     if "component" not in df.columns:
         df["component"] = ""
@@ -165,12 +66,185 @@ def infer_required_course_elements(
     if "context" not in df.columns:
         df["context"] = ""
 
-    df["student_id"] = df["student_id"].astype(str)
-    df["context_clean"] = df["context"].apply(_normalize_context)
+    if "activity" not in df.columns:
+        df["activity"] = ""
 
-    total_students = df["student_id"].nunique()
+    if "process_activity" not in df.columns:
+        df["process_activity"] = df["activity"]
 
-    if total_students == 0:
+    df["component"] = df["component"].fillna("").astype(str)
+    df["context"] = df["context"].fillna("").astype(str)
+    df["activity"] = df["activity"].fillna("").astype(str)
+    df["process_activity"] = df["process_activity"].fillna("").astype(str)
+
+    df["context_norm"] = df["context"].apply(_normalize_context)
+
+    df = df.sort_values(["student_id", "timestamp"]).reset_index(drop=True)
+
+    dedup_cols = [
+        col for col in [
+            "student_id",
+            "timestamp",
+            "component",
+            "context",
+            "activity",
+            "process_activity",
+        ]
+        if col in df.columns
+    ]
+
+    df = df.drop_duplicates(subset=dedup_cols, keep="first").reset_index(drop=True)
+
+    return df
+
+
+# ============================================================
+# Определение типов событий
+# ============================================================
+
+ASSIGNMENT_KEYWORDS = [
+    "задание",
+    "ответ в виде файла",
+    "assignment",
+    "assign",
+    "submit",
+    "submission",
+    "uploaded",
+    "upload",
+    "сдача",
+    "отправка",
+    "загрузка ответа",
+]
+
+TEST_KEYWORDS = [
+    "тест",
+    "quiz",
+    "test",
+    "attempt",
+    "попытка",
+]
+
+LECTURE_KEYWORDS = [
+    "лекция",
+    "lecture",
+    "lesson",
+]
+
+VIEW_KEYWORDS = [
+    "просмотр",
+    "открытие",
+    "view",
+    "viewed",
+    "opened",
+]
+
+SUBMIT_KEYWORDS = [
+    "загрузка",
+    "отправка",
+    "представлена",
+    "submit",
+    "submitted",
+    "upload",
+    "uploaded",
+    "ответ",
+]
+
+TEST_START_KEYWORDS = [
+    "начало",
+    "начата",
+    "started",
+    "attempt started",
+    "попытка начата",
+]
+
+TEST_FINISH_KEYWORDS = [
+    "завершение",
+    "завершена",
+    "finished",
+    "completed",
+    "attempt submitted",
+    "попытка завершена",
+]
+
+LECTURE_FINISH_KEYWORDS = [
+    "завершение",
+    "завершена",
+    "finished",
+    "completed",
+]
+
+
+def _build_search_text(df: pd.DataFrame) -> pd.Series:
+    return (
+        df["component"].fillna("").astype(str)
+        + " "
+        + df["context"].fillna("").astype(str)
+        + " "
+        + df["activity"].fillna("").astype(str)
+        + " "
+        + df["process_activity"].fillna("").astype(str)
+    ).str.lower()
+
+
+def _is_assignment_event(df: pd.DataFrame) -> pd.Series:
+    text = _build_search_text(df)
+    return text.apply(lambda x: _contains_any(x, ASSIGNMENT_KEYWORDS))
+
+
+def _is_test_event(df: pd.DataFrame) -> pd.Series:
+    text = _build_search_text(df)
+    return text.apply(lambda x: _contains_any(x, TEST_KEYWORDS))
+
+
+def _is_lecture_event(df: pd.DataFrame) -> pd.Series:
+    text = _build_search_text(df)
+    return text.apply(lambda x: _contains_any(x, LECTURE_KEYWORDS))
+
+
+def _is_view_event(df: pd.DataFrame) -> pd.Series:
+    text = _build_search_text(df)
+    return text.apply(lambda x: _contains_any(x, VIEW_KEYWORDS))
+
+
+def _is_submit_event(df: pd.DataFrame) -> pd.Series:
+    text = _build_search_text(df)
+    return text.apply(lambda x: _contains_any(x, SUBMIT_KEYWORDS))
+
+
+def _is_test_start_event(df: pd.DataFrame) -> pd.Series:
+    text = _build_search_text(df)
+    return text.apply(lambda x: _contains_any(x, TEST_START_KEYWORDS))
+
+
+def _is_test_finish_event(df: pd.DataFrame) -> pd.Series:
+    text = _build_search_text(df)
+    return text.apply(lambda x: _contains_any(x, TEST_FINISH_KEYWORDS))
+
+
+def _is_lecture_finish_event(df: pd.DataFrame) -> pd.Series:
+    text = _build_search_text(df)
+    return text.apply(lambda x: _contains_any(x, LECTURE_FINISH_KEYWORDS))
+
+
+# ============================================================
+# Автоматическое определение обязательных элементов
+# ============================================================
+
+def infer_required_course_elements(
+    event_log: pd.DataFrame,
+    min_required_completion_share: float = 0.5,
+) -> Dict[str, Any]:
+    """
+    Автоматически находит кандидаты в обязательные задания и тесты.
+
+    Логика:
+    - для заданий считаем студентов, у которых было событие отправки/загрузки;
+    - для тестов считаем студентов, у которых было начало или завершение попытки;
+    - элемент считается обязательным кандидатом, если доля студентов >= порога.
+    """
+    df = _prepare_event_log(event_log)
+
+    if df.empty:
         return {
             "required_assignments": [],
             "required_tests": [],
@@ -178,504 +252,540 @@ def infer_required_course_elements(
             "test_completion_stats": pd.DataFrame(),
         }
 
-    assignment_completed_df = df[
-        df["process_activity"].isin(ASSIGNMENT_SUBMIT_ACTIONS)
-        & df["component"].astype(str).str.contains(
-            "Задание|Ответ в виде файла",
-            case=False,
-            na=False,
-            regex=True,
-        )
-    ].copy()
+    total_students = df["student_id"].nunique()
 
-    if assignment_completed_df.empty:
-        assignment_stats_df = pd.DataFrame(
+    # ----------------------------
+    # Задания
+    # ----------------------------
+    assignment_df = df[_is_assignment_event(df)].copy()
+
+    if not assignment_df.empty:
+        submit_mask = _is_submit_event(assignment_df)
+        assignment_completed_df = assignment_df[submit_mask].copy()
+
+        if assignment_completed_df.empty:
+            assignment_completed_df = assignment_df.copy()
+
+        assignment_stats = (
+            assignment_completed_df
+            .groupby("context_norm")
+            .agg(
+                students_completed=("student_id", "nunique"),
+                events_count=("student_id", "count"),
+                first_event=("timestamp", "min"),
+                last_event=("timestamp", "max"),
+            )
+            .reset_index()
+            .rename(columns={"context_norm": "context"})
+        )
+
+        assignment_stats = assignment_stats[assignment_stats["context"] != ""].copy()
+        assignment_stats["completion_share"] = assignment_stats["students_completed"] / max(total_students, 1)
+        assignment_stats["is_required"] = assignment_stats["completion_share"] >= min_required_completion_share
+
+        assignment_stats = assignment_stats.sort_values(
+            ["is_required", "students_completed", "completion_share"],
+            ascending=[False, False, False],
+        ).reset_index(drop=True)
+    else:
+        assignment_stats = pd.DataFrame(
             columns=[
                 "context",
                 "students_completed",
+                "events_count",
+                "first_event",
+                "last_event",
                 "completion_share",
                 "is_required",
             ]
         )
-    else:
-        assignment_stats_df = (
-            assignment_completed_df
-            .groupby("context_clean")["student_id"]
-            .nunique()
-            .reset_index(name="students_completed")
-            .rename(columns={"context_clean": "context"})
+
+    # ----------------------------
+    # Тесты
+    # ----------------------------
+    test_df = df[_is_test_event(df)].copy()
+
+    if not test_df.empty:
+        test_active_mask = _is_test_start_event(test_df) | _is_test_finish_event(test_df)
+
+        test_completed_df = test_df[test_active_mask].copy()
+
+        if test_completed_df.empty:
+            test_completed_df = test_df.copy()
+
+        test_stats = (
+            test_completed_df
+            .groupby("context_norm")
+            .agg(
+                students_completed=("student_id", "nunique"),
+                events_count=("student_id", "count"),
+                first_event=("timestamp", "min"),
+                last_event=("timestamp", "max"),
+            )
+            .reset_index()
+            .rename(columns={"context_norm": "context"})
         )
 
-        assignment_stats_df["completion_share"] = (
-            assignment_stats_df["students_completed"] / total_students
-        )
+        test_stats = test_stats[test_stats["context"] != ""].copy()
+        test_stats["completion_share"] = test_stats["students_completed"] / max(total_students, 1)
+        test_stats["is_required"] = test_stats["completion_share"] >= min_required_completion_share
 
-        assignment_stats_df["is_required"] = (
-            assignment_stats_df["completion_share"] >= min_required_completion_share
-        )
-
-        assignment_stats_df = assignment_stats_df.sort_values(
-            ["is_required", "students_completed"],
-            ascending=[False, False],
+        test_stats = test_stats.sort_values(
+            ["is_required", "students_completed", "completion_share"],
+            ascending=[False, False, False],
         ).reset_index(drop=True)
+    else:
+        test_stats = pd.DataFrame(
+            columns=[
+                "context",
+                "students_completed",
+                "events_count",
+                "first_event",
+                "last_event",
+                "completion_share",
+                "is_required",
+            ]
+        )
 
     required_assignments = (
-        assignment_stats_df.loc[
-            assignment_stats_df["is_required"],
-            "context",
-        ]
+        assignment_stats.loc[assignment_stats["is_required"], "context"]
+        .dropna()
         .astype(str)
+        .map(_normalize_context)
         .tolist()
-        if not assignment_stats_df.empty
-        else []
     )
 
-    test_completed_df = df[
-        df["process_activity"].isin(TEST_COMPLETION_OR_PARTICIPATION_ACTIONS)
-        & df["component"].astype(str).str.contains(
-            "Тест",
-            case=False,
-            na=False,
-            regex=False,
-        )
-    ].copy()
-
-    if test_completed_df.empty:
-        test_stats_df = pd.DataFrame(
-            columns=[
-                "context",
-                "students_completed",
-                "completion_share",
-                "is_required",
-            ]
-        )
-    else:
-        test_stats_df = (
-            test_completed_df
-            .groupby("context_clean")["student_id"]
-            .nunique()
-            .reset_index(name="students_completed")
-            .rename(columns={"context_clean": "context"})
-        )
-
-        test_stats_df["completion_share"] = (
-            test_stats_df["students_completed"] / total_students
-        )
-
-        test_stats_df["is_required"] = (
-            test_stats_df["completion_share"] >= min_required_completion_share
-        )
-
-        test_stats_df = test_stats_df.sort_values(
-            ["is_required", "students_completed"],
-            ascending=[False, False],
-        ).reset_index(drop=True)
-
     required_tests = (
-        test_stats_df.loc[
-            test_stats_df["is_required"],
-            "context",
-        ]
+        test_stats.loc[test_stats["is_required"], "context"]
+        .dropna()
         .astype(str)
+        .map(_normalize_context)
         .tolist()
-        if not test_stats_df.empty
-        else []
     )
 
     return {
         "required_assignments": required_assignments,
         "required_tests": required_tests,
-        "assignment_completion_stats": assignment_stats_df,
-        "test_completion_stats": test_stats_df,
+        "assignment_completion_stats": assignment_stats,
+        "test_completion_stats": test_stats,
     }
 
 
-def _calculate_assignment_completion(
-    group: pd.DataFrame,
-    required_assignments: list[str],
-) -> dict:
-    completed_assignments = set()
+# ============================================================
+# Расчёт таймингов по студенту
+# ============================================================
 
-    group = group.copy()
-    group["context_clean"] = group["context"].apply(_normalize_context)
+def _calculate_assignment_stats_for_student(
+    student_log: pd.DataFrame,
+    required_assignments: List[str],
+    fast_assignment_minutes: int,
+) -> Dict[str, Any]:
+    assignment_log = student_log[_is_assignment_event(student_log)].copy()
 
-    for _, row in group.iterrows():
-        action = row.get("process_activity")
-        context = row.get("context_clean")
+    completed_assignments = []
+    missing_assignments = []
+    upload_delays = []
+    suspicious_first_upload_count = 0
+    measured_first_upload_count = 0
 
-        if context not in required_assignments:
+    for assignment in required_assignments:
+        assignment_norm = _normalize_context(assignment)
+
+        item_log = assignment_log[
+            assignment_log["context_norm"] == assignment_norm
+        ].copy()
+
+        if item_log.empty:
+            missing_assignments.append(assignment_norm)
             continue
 
-        if action in ASSIGNMENT_SUBMIT_ACTIONS:
-            completed_assignments.add(context)
+        view_log = item_log[_is_view_event(item_log)].copy()
+        submit_log = item_log[_is_submit_event(item_log)].copy()
+
+        if submit_log.empty:
+            # Если явной отправки нет, но есть активность по заданию,
+            # считаем, что студент хотя бы взаимодействовал с элементом.
+            completed_assignments.append(assignment_norm)
+            continue
+
+        completed_assignments.append(assignment_norm)
+
+        first_submit_time = submit_log["timestamp"].min()
+
+        if not view_log.empty:
+            first_view_time = view_log["timestamp"].min()
+        else:
+            first_view_time = item_log["timestamp"].min()
+
+        if pd.notna(first_view_time) and pd.notna(first_submit_time):
+            delay_min = (first_submit_time - first_view_time).total_seconds() / 60
+
+            if delay_min >= 0:
+                upload_delays.append(delay_min)
+                measured_first_upload_count += 1
+
+                if delay_min <= fast_assignment_minutes:
+                    suspicious_first_upload_count += 1
 
     expected_count = len(required_assignments)
-    completed_count = len(completed_assignments)
-
-    missing_assignments = sorted(
-        set(required_assignments) - completed_assignments
-    )
+    completed_count = len(set(completed_assignments))
+    missing_assignments = sorted(set(missing_assignments))
 
     return {
         "completed_assignments_count": completed_count,
         "expected_assignments_count": expected_count,
-        "assignment_completion_ratio": (
-            completed_count / expected_count if expected_count > 0 else 0
+        "assignment_completion_ratio": _safe_ratio(completed_count, expected_count),
+        "completed_assignments_list": "; ".join(sorted(set(completed_assignments))),
+        "missing_assignments_list": "; ".join(missing_assignments),
+        "fast_assignment_upload_count": suspicious_first_upload_count,
+        "measured_assignment_upload_count": measured_first_upload_count,
+        "fast_assignment_upload_ratio": _safe_ratio(
+            suspicious_first_upload_count,
+            measured_first_upload_count,
         ),
-        "completed_assignments_list": ", ".join(sorted(completed_assignments)),
-        "missing_assignments_list": ", ".join(missing_assignments),
+        "median_assignment_upload_delay_min": (
+            float(np.median(upload_delays)) if upload_delays else np.nan
+        ),
+        "suspicious_first_assignment_upload_count": suspicious_first_upload_count,
+        "measured_first_assignment_upload_count": measured_first_upload_count,
+        "suspicious_first_assignment_upload_ratio": _safe_ratio(
+            suspicious_first_upload_count,
+            measured_first_upload_count,
+        ),
+        "median_first_assignment_upload_delay_min": (
+            float(np.median(upload_delays)) if upload_delays else np.nan
+        ),
     }
 
 
-def _calculate_test_completion(
-    group: pd.DataFrame,
-    required_tests: list[str],
-) -> dict:
-    """
-    Тест считается выполненным/учтённым, если он был начат.
+def _calculate_test_stats_for_student(
+    student_log: pd.DataFrame,
+    required_tests: List[str],
+    fast_test_minutes: int,
+) -> Dict[str, Any]:
+    test_log = student_log[_is_test_event(student_log)].copy()
 
-    Это сделано потому, что если тест начат, он фактически должен завершиться,
-    даже если событие завершения не попало в лог.
-    """
-    completed_tests = set()
+    completed_tests = []
+    missing_tests = []
+    test_durations = []
+    fast_test_count = 0
+    measured_test_count = 0
 
-    group = group.copy()
-    group["context_clean"] = group["context"].apply(_normalize_context)
+    for test in required_tests:
+        test_norm = _normalize_context(test)
 
-    for _, row in group.iterrows():
-        action = row.get("process_activity")
-        context = row.get("context_clean")
+        item_log = test_log[
+            test_log["context_norm"] == test_norm
+        ].copy()
 
-        if context not in required_tests:
+        if item_log.empty:
+            missing_tests.append(test_norm)
             continue
 
-        if action in TEST_COMPLETION_OR_PARTICIPATION_ACTIONS:
-            completed_tests.add(context)
+        start_log = item_log[_is_test_start_event(item_log)].copy()
+        finish_log = item_log[_is_test_finish_event(item_log)].copy()
+
+        if not finish_log.empty:
+            completed_tests.append(test_norm)
+        elif not start_log.empty:
+            completed_tests.append(test_norm)
+        else:
+            completed_tests.append(test_norm)
+
+        if not start_log.empty and not finish_log.empty:
+            first_start = start_log["timestamp"].min()
+            first_finish = finish_log["timestamp"].min()
+
+            duration_min = (first_finish - first_start).total_seconds() / 60
+
+            if duration_min >= 0:
+                test_durations.append(duration_min)
+                measured_test_count += 1
+
+                if duration_min <= fast_test_minutes:
+                    fast_test_count += 1
 
     expected_count = len(required_tests)
-    completed_count = len(completed_tests)
-
-    missing_tests = sorted(
-        set(required_tests) - completed_tests
-    )
+    completed_count = len(set(completed_tests))
+    missing_tests = sorted(set(missing_tests))
 
     return {
         "completed_tests_count": completed_count,
         "expected_tests_count": expected_count,
-        "test_completion_ratio": (
-            completed_count / expected_count if expected_count > 0 else 0
-        ),
-        "completed_tests_list": ", ".join(sorted(completed_tests)),
-        "missing_tests_list": ", ".join(missing_tests),
-    }
-
-
-def _calculate_suspicious_first_assignment_uploads(
-    group: pd.DataFrame,
-    required_assignments: list[str],
-    fast_assignment_minutes: int = 15,
-) -> dict:
-    """
-    Считает подозрительную быструю загрузку только в случае:
-    первое открытие задания -> быстрая загрузка ответа.
-
-    Если студент открывал задание раньше, а потом загрузил ответ быстро,
-    это не считается подозрительным.
-    """
-    suspicious_upload_count = 0
-    measured_first_upload_count = 0
-    durations = []
-
-    group = group.copy()
-    group["context_clean"] = group["context"].apply(_normalize_context)
-
-    first_open_time_by_assignment = {}
-    first_submit_time_by_assignment = {}
-
-    for _, row in group.sort_values("timestamp").iterrows():
-        action = row.get("process_activity")
-        context = row.get("context_clean")
-        current_time = row.get("timestamp")
-
-        if context not in required_assignments:
-            continue
-
-        if action in ASSIGNMENT_OPEN_ACTIONS:
-            if context not in first_open_time_by_assignment:
-                first_open_time_by_assignment[context] = current_time
-
-        if action in ASSIGNMENT_SUBMIT_ACTIONS:
-            if context not in first_submit_time_by_assignment:
-                first_submit_time_by_assignment[context] = current_time
-
-    for assignment_context, submit_time in first_submit_time_by_assignment.items():
-        if assignment_context not in first_open_time_by_assignment:
-            continue
-
-        open_time = first_open_time_by_assignment[assignment_context]
-
-        diff_minutes = (submit_time - open_time).total_seconds() / 60
-
-        if diff_minutes < 0:
-            continue
-
-        measured_first_upload_count += 1
-        durations.append(diff_minutes)
-
-        if diff_minutes <= fast_assignment_minutes:
-            suspicious_upload_count += 1
-
-    suspicious_upload_ratio = (
-        suspicious_upload_count / measured_first_upload_count
-        if measured_first_upload_count > 0
-        else 0
-    )
-
-    return {
-        "suspicious_first_assignment_upload_count": suspicious_upload_count,
-        "measured_first_assignment_upload_count": measured_first_upload_count,
-        "suspicious_first_assignment_upload_ratio": round(suspicious_upload_ratio, 4),
-        "median_first_assignment_upload_delay_min": (
-            round(float(np.median(durations)), 2) if durations else None
-        ),
-        "avg_first_assignment_upload_delay_min": (
-            round(float(np.mean(durations)), 2) if durations else None
-        ),
-
-        # Старые названия оставлены для совместимости со страницей.
-        "fast_assignment_upload_count": suspicious_upload_count,
-        "measured_assignment_upload_count": measured_first_upload_count,
-        "fast_assignment_upload_ratio": round(suspicious_upload_ratio, 4),
-        "median_assignment_upload_delay_min": (
-            round(float(np.median(durations)), 2) if durations else None
-        ),
-        "avg_assignment_upload_delay_min": (
-            round(float(np.mean(durations)), 2) if durations else None
-        ),
-    }
-
-
-def _calculate_fast_tests(
-    group: pd.DataFrame,
-    required_tests: list[str],
-    fast_test_minutes: int = 3,
-) -> dict:
-    fast_test_count = 0
-    measured_test_count = 0
-    durations = []
-
-    group = group.copy()
-    group["context_clean"] = group["context"].apply(_normalize_context)
-
-    test_start_times = {}
-
-    for _, row in group.sort_values("timestamp").iterrows():
-        action = row.get("process_activity")
-        context = row.get("context_clean")
-        current_time = row.get("timestamp")
-
-        if context not in required_tests:
-            continue
-
-        if action in TEST_START_ACTIONS:
-            test_start_times[context] = current_time
-
-        if action in TEST_FINISH_ACTIONS:
-            if context not in test_start_times:
-                continue
-
-            start_time = test_start_times[context]
-            diff_minutes = (current_time - start_time).total_seconds() / 60
-
-            if diff_minutes < 0:
-                continue
-
-            measured_test_count += 1
-            durations.append(diff_minutes)
-
-            if diff_minutes <= fast_test_minutes:
-                fast_test_count += 1
-
-            test_start_times.pop(context, None)
-
-    fast_test_ratio = (
-        fast_test_count / measured_test_count
-        if measured_test_count > 0
-        else 0
-    )
-
-    return {
+        "test_completion_ratio": _safe_ratio(completed_count, expected_count),
+        "completed_tests_list": "; ".join(sorted(set(completed_tests))),
+        "missing_tests_list": "; ".join(missing_tests),
         "fast_test_completion_count": fast_test_count,
         "measured_test_completion_count": measured_test_count,
-        "fast_test_completion_ratio": round(fast_test_ratio, 4),
+        "fast_test_completion_ratio": _safe_ratio(fast_test_count, measured_test_count),
         "median_test_duration_min": (
-            round(float(np.median(durations)), 2) if durations else None
-        ),
-        "avg_test_duration_min": (
-            round(float(np.mean(durations)), 2) if durations else None
+            float(np.median(test_durations)) if test_durations else np.nan
         ),
     }
 
 
-def _calculate_fast_lectures(
-    group: pd.DataFrame,
-    fast_lecture_minutes: int = 2,
-) -> dict:
+def _calculate_lecture_stats_for_student(
+    student_log: pd.DataFrame,
+    fast_lecture_minutes: int,
+) -> Dict[str, Any]:
+    lecture_log = student_log[_is_lecture_event(student_log)].copy()
+
+    if lecture_log.empty:
+        return {
+            "fast_lecture_completion_count": 0,
+            "measured_lecture_completion_count": 0,
+            "fast_lecture_completion_ratio": 0.0,
+            "median_lecture_duration_min": np.nan,
+        }
+
+    lecture_durations = []
     fast_lecture_count = 0
     measured_lecture_count = 0
-    durations = []
 
-    lecture_start_times = {}
-
-    for _, row in group.sort_values("timestamp").iterrows():
-        action = row.get("process_activity")
-        context = _normalize_context(row.get("context"))
-        current_time = row.get("timestamp")
-
-        if "лекция" not in context.lower():
+    for context_norm, item_log in lecture_log.groupby("context_norm"):
+        if context_norm == "":
             continue
 
-        if action in LECTURE_START_ACTIONS:
-            lecture_start_times[context] = current_time
+        first_open = item_log["timestamp"].min()
 
-        if action in LECTURE_END_ACTIONS:
-            if context not in lecture_start_times:
-                continue
+        finish_log = item_log[_is_lecture_finish_event(item_log)].copy()
 
-            start_time = lecture_start_times[context]
-            diff_minutes = (current_time - start_time).total_seconds() / 60
+        if finish_log.empty:
+            continue
 
-            if diff_minutes < 0:
-                continue
+        first_finish = finish_log["timestamp"].min()
 
+        duration_min = (first_finish - first_open).total_seconds() / 60
+
+        if duration_min >= 0:
+            lecture_durations.append(duration_min)
             measured_lecture_count += 1
-            durations.append(diff_minutes)
 
-            if diff_minutes <= fast_lecture_minutes:
+            if duration_min <= fast_lecture_minutes:
                 fast_lecture_count += 1
-
-            lecture_start_times.pop(context, None)
-
-    fast_lecture_ratio = (
-        fast_lecture_count / measured_lecture_count
-        if measured_lecture_count > 0
-        else 0
-    )
 
     return {
         "fast_lecture_completion_count": fast_lecture_count,
         "measured_lecture_completion_count": measured_lecture_count,
-        "fast_lecture_completion_ratio": round(fast_lecture_ratio, 4),
-        "median_lecture_duration_min": (
-            round(float(np.median(durations)), 2) if durations else None
+        "fast_lecture_completion_ratio": _safe_ratio(
+            fast_lecture_count,
+            measured_lecture_count,
         ),
-        "avg_lecture_duration_min": (
-            round(float(np.mean(durations)), 2) if durations else None
+        "median_lecture_duration_min": (
+            float(np.median(lecture_durations)) if lecture_durations else np.nan
         ),
     }
 
 
-def _build_process_flags(row: pd.Series) -> list[str]:
-    flags = []
+def _calculate_temporal_stats_for_student(
+    student_log: pd.DataFrame,
+    course_start: pd.Timestamp,
+    course_end: pd.Timestamp,
+    last_period_days: int,
+) -> Dict[str, Any]:
+    student_log = student_log.sort_values("timestamp").copy()
 
-    total_events = float(row.get("process_total_events", 0))
-    active_days = float(row.get("process_active_days", 0))
+    total_events = len(student_log)
 
-    completed_assignments = float(row.get("completed_assignments_count", 0))
-    expected_assignments = float(row.get("expected_assignments_count", 0))
+    if total_events == 0:
+        return {
+            "process_total_events": 0,
+            "process_active_days": 0,
+            "max_day_activity_ratio": 0.0,
+            "top_2_days_activity_ratio": 0.0,
+            "top_3_days_activity_ratio": 0.0,
+            "days_to_80_percent_events": np.nan,
+            "last_period_events_ratio": 0.0,
+        }
 
-    completed_tests = float(row.get("completed_tests_count", 0))
-    expected_tests = float(row.get("expected_tests_count", 0))
+    student_log["date"] = student_log["timestamp"].dt.date
 
-    max_day_ratio = float(row.get("max_day_activity_ratio", 0))
-    top_2_ratio = float(row.get("top_2_days_activity_ratio", 0))
-    top_3_ratio = float(row.get("top_3_days_activity_ratio", 0))
-    days_to_80 = float(row.get("days_to_80_percent_events", 999))
-
-    material_share = float(row.get("process_material_share", 0))
-    control_share = float(row.get("process_control_share", 0))
-
-    fast_lecture_ratio = float(row.get("fast_lecture_completion_ratio", 0))
-    measured_lecture_count = float(row.get("measured_lecture_completion_count", 0))
-
-    fast_test_count = float(row.get("fast_test_completion_count", 0))
-
-    suspicious_assignment_count = float(
-        row.get("suspicious_first_assignment_upload_count", 0)
+    daily_counts = (
+        student_log
+        .groupby("date")
+        .size()
+        .sort_values(ascending=False)
     )
 
-    if expected_assignments > 0 and completed_assignments < expected_assignments:
-        flags.append("Неполное выполнение заданий")
+    active_days = len(daily_counts)
 
-    if expected_tests > 0 and completed_tests < expected_tests:
-        flags.append("Неполное выполнение тестов")
+    max_day_activity_ratio = _safe_ratio(daily_counts.iloc[0], total_events)
 
-    if total_events <= 10 or active_days <= 1:
-        flags.append("Эпизодическое прохождение")
+    top_2_days_activity_ratio = _safe_ratio(
+        daily_counts.head(2).sum(),
+        total_events,
+    )
 
-    if days_to_80 <= 2 or top_2_ratio >= 0.85:
-        flags.append("Авральное прохождение курса")
-    elif days_to_80 <= 3 and top_3_ratio >= 0.90:
-        flags.append("Авральное прохождение курса")
+    top_3_days_activity_ratio = _safe_ratio(
+        daily_counts.head(3).sum(),
+        total_events,
+    )
 
-    if (
-        material_share > 0
-        and control_share > 0
-        and (
-            max_day_ratio >= 0.65
-            or top_2_ratio >= 0.80
-            or days_to_80 <= 3
-        )
-    ):
-        flags.append("Формально комплексное прохождение")
+    ordered_log = student_log.sort_values("timestamp").copy()
+    ordered_log["event_number"] = np.arange(1, len(ordered_log) + 1)
+    threshold_80 = total_events * 0.8
 
-    if measured_lecture_count >= 5 and fast_lecture_ratio >= 0.70:
-        flags.append("Формальное прохождение лекционных элементов")
+    event_80 = ordered_log[ordered_log["event_number"] >= threshold_80].head(1)
 
-    if fast_test_count >= 2:
-        flags.append("Быстрое прохождение тестов")
+    if not event_80.empty:
+        days_to_80 = (
+            event_80["timestamp"].iloc[0] - ordered_log["timestamp"].min()
+        ).total_seconds() / 86400
+    else:
+        days_to_80 = np.nan
 
-    if suspicious_assignment_count >= 2:
-        flags.append("Подозрительно быстрая первая загрузка ответов")
+    last_period_start = course_end - pd.Timedelta(days=last_period_days)
 
-    if active_days >= 5 and days_to_80 >= 4 and top_2_ratio < 0.75:
-        flags.append("Регулярное прохождение")
-
-    return flags
-
-
-def _choose_main_process_pattern(flags: list[str]) -> str:
-    """
-    Основной паттерн выбирается по приоритету, но все остальные признаки
-    сохраняются в process_flags.
-    """
-    priority = [
-        "Неполное выполнение заданий",
-        "Неполное выполнение тестов",
-        "Эпизодическое прохождение",
-        "Авральное прохождение курса",
-        "Формально комплексное прохождение",
-        "Формальное прохождение лекционных элементов",
-        "Быстрое прохождение тестов",
-        "Подозрительно быстрая первая загрузка ответов",
-        "Регулярное прохождение",
+    last_period_events = student_log[
+        student_log["timestamp"] >= last_period_start
     ]
 
-    for pattern in priority:
-        if pattern in flags:
-            if pattern in [
-                "Неполное выполнение заданий",
-                "Неполное выполнение тестов",
-            ]:
-                return "Неполное выполнение контрольных активностей"
+    last_period_events_ratio = _safe_ratio(len(last_period_events), total_events)
 
-            if pattern == "Подозрительно быстрая первая загрузка ответов":
-                return "Подозрительно быстрая первая загрузка ответов"
+    return {
+        "process_total_events": total_events,
+        "process_active_days": active_days,
+        "max_day_activity_ratio": max_day_activity_ratio,
+        "top_2_days_activity_ratio": top_2_days_activity_ratio,
+        "top_3_days_activity_ratio": top_3_days_activity_ratio,
+        "days_to_80_percent_events": days_to_80,
+        "last_period_events_ratio": last_period_events_ratio,
+    }
 
-            return pattern
 
-    return "Смешанный процессный профиль"
+def _calculate_trace_stats_for_student(student_log: pd.DataFrame) -> Dict[str, Any]:
+    student_log = student_log.sort_values("timestamp").copy()
 
+    activities = student_log["process_activity"].fillna("").astype(str).tolist()
+    trace_length = len(activities)
+
+    if trace_length == 0:
+        return {
+            "trace_length": 0,
+            "linearity": 0.0,
+            "complexity": 0.0,
+            "returns_count": 0,
+            "variant": "",
+            "variant_frequency": 1,
+        }
+
+    unique_activities = len(set(activities))
+    linearity = _safe_ratio(unique_activities, trace_length)
+
+    returns_count = 0
+    seen = set()
+
+    for activity in activities:
+        if activity in seen:
+            returns_count += 1
+        seen.add(activity)
+
+    complexity = float(trace_length + returns_count)
+
+    variant = " → ".join(activities)
+
+    return {
+        "trace_length": trace_length,
+        "linearity": linearity,
+        "complexity": complexity,
+        "returns_count": returns_count,
+        "variant": variant,
+        "variant_frequency": 1,
+    }
+
+
+# ============================================================
+# Интерпретация процессного паттерна
+# ============================================================
+
+def _build_process_interpretation(row: Dict[str, Any]) -> Dict[str, Any]:
+    flags = []
+
+    control_completion_ratio = row.get("control_completion_ratio", 0.0)
+    assignment_completion_ratio = row.get("assignment_completion_ratio", 0.0)
+    test_completion_ratio = row.get("test_completion_ratio", 0.0)
+
+    top_2_days_activity_ratio = row.get("top_2_days_activity_ratio", 0.0)
+    last_period_events_ratio = row.get("last_period_events_ratio", 0.0)
+
+    fast_lecture_ratio = row.get("fast_lecture_completion_ratio", 0.0)
+    fast_test_ratio = row.get("fast_test_completion_ratio", 0.0)
+    fast_assignment_upload_ratio = row.get("suspicious_first_assignment_upload_ratio", 0.0)
+
+    active_days = row.get("process_active_days", 0)
+    total_events = row.get("process_total_events", 0)
+
+    if control_completion_ratio < 0.5:
+        flags.append("Неполное выполнение контрольных активностей")
+
+    if top_2_days_activity_ratio >= 0.6 or last_period_events_ratio >= 0.6:
+        flags.append("Сжатое прохождение курса")
+
+    if fast_lecture_ratio >= 0.5 and row.get("measured_lecture_completion_count", 0) > 0:
+        flags.append("Формальное прохождение лекционных элементов")
+
+    if fast_test_ratio >= 0.5 and row.get("measured_test_completion_count", 0) > 0:
+        flags.append("Быстрое прохождение тестов")
+
+    if fast_assignment_upload_ratio >= 0.5 and row.get("measured_first_assignment_upload_count", 0) > 0:
+        flags.append("Подозрительно быстрая первая загрузка ответов")
+
+    if active_days <= 2 and total_events >= 20:
+        flags.append("Концентрированная активность за короткий период")
+
+    if not flags:
+        if control_completion_ratio >= 0.8 and active_days >= 5:
+            process_pattern = "Регулярное прохождение"
+        elif control_completion_ratio >= 0.8:
+            process_pattern = "Выполнение основных контрольных активностей"
+        else:
+            process_pattern = "Умеренно выраженный процессный паттерн"
+    else:
+        if "Неполное выполнение контрольных активностей" in flags:
+            process_pattern = "Неполное выполнение контрольных активностей"
+        elif "Сжатое прохождение курса" in flags:
+            process_pattern = "Сжатое прохождение курса"
+        elif (
+            "Формальное прохождение лекционных элементов" in flags
+            and "Быстрое прохождение тестов" in flags
+        ):
+            process_pattern = "Формально комплексное прохождение"
+        elif "Формальное прохождение лекционных элементов" in flags:
+            process_pattern = "Формальное прохождение лекционных элементов"
+        elif "Быстрое прохождение тестов" in flags:
+            process_pattern = "Быстрое прохождение тестов"
+        elif "Подозрительно быстрая первая загрузка ответов" in flags:
+            process_pattern = "Подозрительно быстрая первая загрузка ответов"
+        else:
+            process_pattern = flags[0]
+
+    process_flags = "; ".join(flags) if flags else "Нет выраженных дополнительных признаков"
+
+    description_parts = [
+        f"Процессный паттерн: {process_pattern}.",
+        f"Выполнение заданий: {assignment_completion_ratio:.2f}.",
+        f"Выполнение тестов: {test_completion_ratio:.2f}.",
+        f"Общая полнота контрольных активностей: {control_completion_ratio:.2f}.",
+        f"Активных дней: {active_days}.",
+        f"Доля активности в два самых активных дня: {top_2_days_activity_ratio:.2f}.",
+    ]
+
+    if flags:
+        description_parts.append(f"Дополнительные признаки: {process_flags}.")
+    else:
+        description_parts.append("Выраженных рискованных процессных признаков не обнаружено.")
+
+    return {
+        "process_pattern": process_pattern,
+        "process_flags": process_flags,
+        "process_flags_count": len(flags),
+        "final_behavior_description": " ".join(description_parts),
+    }
+
+
+# ============================================================
+# Главная функция расчёта process behavior features
+# ============================================================
 
 def calculate_student_process_behavior_features(
     event_log: pd.DataFrame,
@@ -684,349 +794,143 @@ def calculate_student_process_behavior_features(
     fast_test_minutes: int = 3,
     fast_lecture_minutes: int = 2,
     min_required_completion_share: float = 0.5,
+    required_assignments: Optional[List[str]] = None,
+    required_tests: Optional[List[str]] = None,
 ) -> pd.DataFrame:
-    if event_log is None or event_log.empty:
-        return pd.DataFrame()
+    """
+    Рассчитывает процессные признаки студентов.
 
-    required_columns = ["student_id", "timestamp", "process_activity"]
+    Если required_assignments и required_tests переданы вручную,
+    расчёт идёт именно по ним.
 
-    missing_columns = [
-        col for col in required_columns
-        if col not in event_log.columns
-    ]
-
-    if missing_columns:
-        raise ValueError(
-            "Для расчёта процессных паттернов не хватает колонок: "
-            + ", ".join(missing_columns)
-        )
-
-    df = event_log.copy()
-
-    if "component" not in df.columns:
-        df["component"] = ""
-
-    if "context" not in df.columns:
-        df["context"] = ""
-
-    df["student_id"] = df["student_id"].astype(str)
-    df["timestamp"] = _safe_datetime(df["timestamp"])
-
-    df = df[df["timestamp"].notna()].copy()
+    Если они не переданы, список обязательных элементов определяется автоматически.
+    """
+    df = _prepare_event_log(event_log)
 
     if df.empty:
         return pd.DataFrame()
 
-    inferred_elements = infer_required_course_elements(
-        event_log=df,
-        min_required_completion_share=min_required_completion_share,
-    )
+    if required_assignments is None or required_tests is None:
+        inferred_elements = infer_required_course_elements(
+            event_log=df,
+            min_required_completion_share=min_required_completion_share,
+        )
 
-    required_assignments = inferred_elements["required_assignments"]
-    required_tests = inferred_elements["required_tests"]
+        if required_assignments is None:
+            required_assignments = inferred_elements["required_assignments"]
+
+        if required_tests is None:
+            required_tests = inferred_elements["required_tests"]
+
+    required_assignments = [
+        _normalize_context(item)
+        for item in required_assignments
+        if _normalize_context(item)
+    ]
+
+    required_tests = [
+        _normalize_context(item)
+        for item in required_tests
+        if _normalize_context(item)
+    ]
+
+    required_assignments = sorted(set(required_assignments))
+    required_tests = sorted(set(required_tests))
 
     course_start = df["timestamp"].min()
     course_end = df["timestamp"].max()
-    last_period_start = course_end - pd.Timedelta(days=last_period_days)
 
     rows = []
 
-    for student_id, group in df.sort_values("timestamp").groupby("student_id"):
-        group = group.copy()
+    for student_id, student_log in df.groupby("student_id"):
+        student_log = student_log.sort_values("timestamp").copy()
 
-        total_events = len(group)
-
-        if total_events == 0:
-            continue
-
-        first_event_time = group["timestamp"].min()
-        last_event_time = group["timestamp"].max()
-        active_days = group["timestamp"].dt.date.nunique()
-
-        activity_span_days = (
-            (last_event_time - first_event_time).total_seconds() / 86400
-        )
-
-        events_by_day = group.groupby(group["timestamp"].dt.date).size()
-        max_day_events = int(events_by_day.max())
-
-        max_day_activity_ratio = (
-            max_day_events / total_events if total_events > 0 else 0
-        )
-
-        top_2_days_activity_ratio = _calculate_top_days_ratio(group, 2)
-        top_3_days_activity_ratio = _calculate_top_days_ratio(group, 3)
-
-        days_to_80_percent_events = _calculate_days_to_percent_events(
-            group,
-            percent=0.8,
-        )
-
-        last_period_events = group[group["timestamp"] >= last_period_start]
-
-        last_period_activity_ratio = (
-            len(last_period_events) / total_events if total_events > 0 else 0
-        )
-
-        material_events = group[
-            group["process_activity"].isin(MATERIAL_ACTIONS)
-        ]
-
-        control_events = group[
-            group["process_activity"].isin(CONTROL_ACTIONS)
-        ]
-
-        material_events_count = len(material_events)
-        control_events_count = len(control_events)
-
-        material_share = (
-            material_events_count / total_events if total_events > 0 else 0
-        )
-
-        control_share = (
-            control_events_count / total_events if total_events > 0 else 0
-        )
-
-        assignment_completion = _calculate_assignment_completion(
-            group=group,
-            required_assignments=required_assignments,
-        )
-
-        test_completion = _calculate_test_completion(
-            group=group,
-            required_tests=required_tests,
-        )
-
-        suspicious_assignments = _calculate_suspicious_first_assignment_uploads(
-            group=group,
+        assignment_stats = _calculate_assignment_stats_for_student(
+            student_log=student_log,
             required_assignments=required_assignments,
             fast_assignment_minutes=fast_assignment_minutes,
         )
 
-        fast_tests = _calculate_fast_tests(
-            group=group,
+        test_stats = _calculate_test_stats_for_student(
+            student_log=student_log,
             required_tests=required_tests,
             fast_test_minutes=fast_test_minutes,
         )
 
-        fast_lectures = _calculate_fast_lectures(
-            group=group,
+        lecture_stats = _calculate_lecture_stats_for_student(
+            student_log=student_log,
             fast_lecture_minutes=fast_lecture_minutes,
         )
 
-        completed_assignments_count = assignment_completion[
-            "completed_assignments_count"
-        ]
+        temporal_stats = _calculate_temporal_stats_for_student(
+            student_log=student_log,
+            course_start=course_start,
+            course_end=course_end,
+            last_period_days=last_period_days,
+        )
 
-        expected_assignments_count = assignment_completion[
-            "expected_assignments_count"
-        ]
-
-        completed_tests_count = test_completion[
-            "completed_tests_count"
-        ]
-
-        expected_tests_count = test_completion[
-            "expected_tests_count"
-        ]
+        trace_stats = _calculate_trace_stats_for_student(student_log)
 
         expected_control_count = (
-            expected_assignments_count + expected_tests_count
+            assignment_stats["expected_assignments_count"]
+            + test_stats["expected_tests_count"]
         )
 
         completed_control_count = (
-            completed_assignments_count + completed_tests_count
-        )
-
-        control_completion_ratio = (
-            completed_control_count / expected_control_count
-            if expected_control_count > 0
-            else 0
+            assignment_stats["completed_assignments_count"]
+            + test_stats["completed_tests_count"]
         )
 
         row = {
-            "student_id": student_id,
-
-            "process_total_events": total_events,
-            "process_active_days": active_days,
-            "process_activity_span_days": round(activity_span_days, 2),
-
-            "max_day_activity_ratio": round(max_day_activity_ratio, 4),
-            "top_2_days_activity_ratio": round(top_2_days_activity_ratio, 4),
-            "top_3_days_activity_ratio": round(top_3_days_activity_ratio, 4),
-            "days_to_80_percent_events": days_to_80_percent_events,
-
-            "last_period_activity_ratio": round(last_period_activity_ratio, 4),
-            "last_period_days": last_period_days,
-
-            "material_events_count": material_events_count,
-            "control_events_count": control_events_count,
-            "process_material_share": round(material_share, 4),
-            "process_control_share": round(control_share, 4),
-
-            "expected_control_count": expected_control_count,
+            "student_id": str(student_id),
+            **assignment_stats,
+            **test_stats,
+            **lecture_stats,
+            **temporal_stats,
+            **trace_stats,
             "completed_control_count": completed_control_count,
-            "control_completion_ratio": round(control_completion_ratio, 4),
-
+            "expected_control_count": expected_control_count,
+            "control_completion_ratio": _safe_ratio(
+                completed_control_count,
+                expected_control_count,
+            ),
             "required_assignments_count": len(required_assignments),
             "required_tests_count": len(required_tests),
-
-            "first_event_time": first_event_time,
-            "last_event_time": last_event_time,
-            "course_start": course_start,
-            "course_end": course_end,
+            "required_assignments_list": "; ".join(required_assignments),
+            "required_tests_list": "; ".join(required_tests),
         }
 
-        row.update(assignment_completion)
-        row.update(test_completion)
-        row.update(suspicious_assignments)
-        row.update(fast_tests)
-        row.update(fast_lectures)
+        interpretation = _build_process_interpretation(row)
+        row.update(interpretation)
 
         rows.append(row)
 
-    features_df = pd.DataFrame(rows)
+    result_df = pd.DataFrame(rows)
 
-    if features_df.empty:
-        return features_df
+    if result_df.empty:
+        return result_df
 
-    flags_series = features_df.apply(_build_process_flags, axis=1)
+    # Частота варианта траектории
+    if "variant" in result_df.columns:
+        variant_counts = result_df["variant"].value_counts().to_dict()
+        result_df["variant_frequency"] = result_df["variant"].map(variant_counts)
 
-    features_df["process_flags"] = flags_series.apply(
-        lambda flags: "; ".join(flags) if flags else "Нет выраженных дополнительных признаков"
-    )
-
-    features_df["process_flags_count"] = flags_series.apply(len)
-
-    features_df["process_pattern"] = flags_series.apply(
-        _choose_main_process_pattern
-    )
-
-    features_df["process_pattern_description"] = features_df.apply(
-        build_process_pattern_description,
-        axis=1,
-    )
-
-    features_df["required_assignments_list"] = ", ".join(required_assignments)
-    features_df["required_tests_list"] = ", ".join(required_tests)
-
-    return features_df
+    return result_df
 
 
-def build_process_pattern_description(row: pd.Series) -> str:
-    pattern = row.get("process_pattern", "Смешанный процессный профиль")
-    flags = row.get("process_flags", "")
-
-    total_events = int(row.get("process_total_events", 0))
-    active_days = int(row.get("process_active_days", 0))
-
-    completed_assignments = int(row.get("completed_assignments_count", 0))
-    expected_assignments = int(row.get("expected_assignments_count", 0))
-
-    completed_tests = int(row.get("completed_tests_count", 0))
-    expected_tests = int(row.get("expected_tests_count", 0))
-
-    control_completion_ratio = float(row.get("control_completion_ratio", 0))
-
-    max_day_ratio = float(row.get("max_day_activity_ratio", 0))
-    top_2_ratio = float(row.get("top_2_days_activity_ratio", 0))
-    top_3_ratio = float(row.get("top_3_days_activity_ratio", 0))
-    days_to_80 = int(row.get("days_to_80_percent_events", 0))
-
-    fast_lecture_count = int(row.get("fast_lecture_completion_count", 0))
-    measured_lecture_count = int(row.get("measured_lecture_completion_count", 0))
-    fast_lecture_ratio = float(row.get("fast_lecture_completion_ratio", 0))
-
-    fast_test_count = int(row.get("fast_test_completion_count", 0))
-    measured_test_count = int(row.get("measured_test_completion_count", 0))
-
-    suspicious_upload_count = int(
-        row.get("suspicious_first_assignment_upload_count", 0)
-    )
-
-    measured_first_upload_count = int(
-        row.get("measured_first_assignment_upload_count", 0)
-    )
-
-    base = ""
-
-    if pattern == "Неполное выполнение контрольных активностей":
-        base = (
-            "Студент выполнил не все обязательные контрольные активности курса. "
-            f"Выполнено заданий: {completed_assignments} из {expected_assignments}. "
-            f"Выполнено тестов: {completed_tests} из {expected_tests}. "
-            f"Общая полнота выполнения контрольных активностей: "
-            f"{control_completion_ratio:.2f}."
-        )
-
-    elif pattern == "Авральное прохождение курса":
-        base = (
-            "Большая часть действий студента была выполнена в короткий промежуток времени. "
-            f"80% всех действий сделаны за {days_to_80} активн. дн.; "
-            f"доля действий в два самых активных дня: {top_2_ratio:.2f}; "
-            f"доля действий в три самых активных дня: {top_3_ratio:.2f}."
-        )
-
-    elif pattern == "Формально комплексное прохождение":
-        base = (
-            "Студент использовал разные элементы курса, однако активность сильно "
-            "сконцентрирована во времени. "
-            f"Доля действий в самый активный день: {max_day_ratio:.2f}; "
-            f"80% действий сделаны за {days_to_80} активн. дн."
-        )
-
-    elif pattern == "Формальное прохождение лекционных элементов":
-        base = (
-            "У студента обнаружены признаки формального прохождения лекций. "
-            f"Быстро завершённых лекций: {fast_lecture_count} из "
-            f"{measured_lecture_count}; доля быстрых лекций: {fast_lecture_ratio:.2f}."
-        )
-
-    elif pattern == "Быстрое прохождение тестов":
-        base = (
-            "У студента обнаружены тесты, завершённые за очень короткое время. "
-            f"Быстрых завершений тестов: {fast_test_count} из "
-            f"{measured_test_count}."
-        )
-
-    elif pattern == "Подозрительно быстрая первая загрузка ответов":
-        base = (
-            "У студента обнаружены случаи, когда задание впервые открывалось "
-            "и ответ загружался почти сразу. "
-            f"Таких случаев: {suspicious_upload_count} из "
-            f"{measured_first_upload_count} измеренных первых загрузок."
-        )
-
-    elif pattern == "Регулярное прохождение":
-        base = (
-            "Активность студента распределена относительно равномерно. "
-            f"Активных дней: {active_days}; всего действий: {total_events}; "
-            f"80% действий сделаны за {days_to_80} активн. дн."
-        )
-
-    elif pattern == "Эпизодическое прохождение":
-        base = (
-            "Студент редко взаимодействовал с курсом. "
-            f"Активных дней: {active_days}; всего действий: {total_events}."
-        )
-
-    else:
-        base = (
-            "Поведение студента не относится к одному явно выраженному процессному типу. "
-            f"Активных дней: {active_days}; всего действий: {total_events}; "
-            f"80% действий сделаны за {days_to_80} активн. дн."
-        )
-
-    if flags and flags != "Нет выраженных дополнительных признаков":
-        base += f" Дополнительные выявленные признаки: {flags}."
-
-    return base
-
+# ============================================================
+# Объединение ресурсных и процессных паттернов
+# ============================================================
 
 def merge_resource_and_process_patterns(
     resource_patterns_df: pd.DataFrame,
     process_features_df: pd.DataFrame,
 ) -> pd.DataFrame:
+    """
+    Объединяет:
+    - ресурсный паттерн из ML-кластеризации;
+    - процессный паттерн из process mining.
+    """
     if process_features_df is None or process_features_df.empty:
         return pd.DataFrame()
 
@@ -1035,62 +939,37 @@ def merge_resource_and_process_patterns(
 
     if resource_patterns_df is None or resource_patterns_df.empty:
         result_df = process_df.copy()
-        result_df["cluster"] = None
-        result_df["resource_pattern"] = None
+        result_df["cluster"] = np.nan
+        result_df["resource_pattern"] = "Нет ресурсного паттерна"
     else:
         resource_df = resource_patterns_df.copy()
         resource_df["student_id"] = resource_df["student_id"].astype(str)
 
-        resource_df = resource_df.rename(
-            columns={
-                "suggested_name": "resource_pattern",
-            }
-        )
+        if "suggested_name" in resource_df.columns and "resource_pattern" not in resource_df.columns:
+            resource_df = resource_df.rename(columns={"suggested_name": "resource_pattern"})
 
-        keep_columns = [
+        if "resource_pattern" not in resource_df.columns:
+            resource_df["resource_pattern"] = "Ресурсный паттерн не определён"
+
+        merge_cols = [
             col for col in ["student_id", "cluster", "resource_pattern"]
             if col in resource_df.columns
         ]
 
         result_df = process_df.merge(
-            resource_df[keep_columns],
+            resource_df[merge_cols].drop_duplicates(subset=["student_id"]),
             on="student_id",
             how="left",
         )
 
-    result_df["final_behavior_pattern"] = result_df.apply(
-        build_final_behavior_pattern,
-        axis=1,
-    )
+        result_df["resource_pattern"] = result_df["resource_pattern"].fillna(
+            "Нет ресурсного паттерна"
+        )
 
-    result_df["final_behavior_description"] = result_df.apply(
-        build_final_behavior_description,
-        axis=1,
+    result_df["final_behavior_pattern"] = (
+        result_df["resource_pattern"].astype(str)
+        + " + "
+        + result_df["process_pattern"].astype(str)
     )
 
     return result_df
-
-
-def build_final_behavior_pattern(row: pd.Series) -> str:
-    resource_pattern = row.get("resource_pattern")
-    process_pattern = row.get("process_pattern")
-
-    if pd.isna(resource_pattern) or not resource_pattern:
-        return str(process_pattern)
-
-    return f"{resource_pattern} + {process_pattern}"
-
-
-def build_final_behavior_description(row: pd.Series) -> str:
-    resource_pattern = row.get("resource_pattern")
-    process_pattern = row.get("process_pattern")
-    process_description = row.get("process_pattern_description")
-
-    if pd.isna(resource_pattern) or not resource_pattern:
-        return str(process_description)
-
-    return (
-        f"По ресурсному профилю студент относится к группе: «{resource_pattern}». "
-        f"Процессный анализ уточняет характер прохождения: «{process_pattern}». "
-        f"{process_description}"
-    )

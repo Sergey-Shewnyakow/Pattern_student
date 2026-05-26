@@ -513,8 +513,6 @@ if st.session_state.get("gmm_result") is not None:
         "—" if bic is None else f"{bic:.2f}",
     )
 
-    st.subheader("Использованные признаки")
-    st.write(used_features)
 
     st.subheader("Автоматические названия кластеров")
     st.dataframe(
