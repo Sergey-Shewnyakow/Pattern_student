@@ -159,7 +159,7 @@ def build_student_interpretation(comparison_df: pd.DataFrame, student_id: str, c
 
 
 st.title("KMeans Clustering")
-st.write("Кластеризация подготовленных данных методом KMeans.")
+
 
 features_df_for_clustering = st.session_state.get("features_df_for_clustering")
 

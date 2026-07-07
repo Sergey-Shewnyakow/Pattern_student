@@ -28,11 +28,6 @@ apply_global_styles()
 
 st.title("Deep Embedding Clustering")
 
-st.write(
-    "Deep Embedding Clustering используется как дополнительный экспериментальный метод. "
-    "Сначала автоэнкодер строит скрытое представление студентов, затем KMeans выполняет "
-    "кластеризацию в embedding-пространстве."
-)
 
 
 def build_student_cluster_comparison(
